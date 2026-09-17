@@ -206,14 +206,33 @@ struct PlanParameters {
 struct LocalTrajData {
   /* info of generated traj */
 
-  int traj_id_;
-  double duration_;
+  int traj_id_ = 0;
+  double duration_ = 0.0;
   ros::Time start_time_;
   Eigen::Vector3d start_pos_;
   NonUniformBspline position_traj_, velocity_traj_, acceleration_traj_, yaw_traj_, yawdot_traj_,
       yawdotdot_traj_;
   NonUniformBspline position_traj_tmp_;//用来检查B样条的变化
   NonUniformBspline position_traj_2D_;
+};
+
+struct CandidatePlan {
+  bool planning_success = false;
+  bool collision_valid = false;
+  bool velocity_valid = false;
+  bool acceleration_valid = false;
+  bool from_topology_proposal = false;
+  uint64_t topology_path_id = 0;
+  vector<Eigen::Vector3d> guide_path;
+  Eigen::Vector3d waypoint = Eigen::Vector3d::Zero();
+  LocalTrajData trajectory;
+
+  bool valid() const {
+    return planning_success && collision_valid && velocity_valid &&
+           acceleration_valid;
+  }
+
+  void reset() { *this = CandidatePlan(); }
 };
 
 class MidPlanData {

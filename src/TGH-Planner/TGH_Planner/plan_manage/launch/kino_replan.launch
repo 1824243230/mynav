@@ -33,7 +33,7 @@
   <arg name="robot_odom" value="/car_odom"/>
   <arg name="sensor_odom" value="/jackal/velodyne/gazebo_gt/odometry"/>
   <arg name="sensor_odom_parent_frame"  value="world"/>
-  <arg name="max_vel_" value="2.0" />
+  <arg name="max_vel_" value="1.9" />
   <arg name="max_acc_" value="1.5" />
 
 

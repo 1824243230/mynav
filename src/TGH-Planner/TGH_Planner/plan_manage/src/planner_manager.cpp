@@ -299,6 +299,7 @@ bool FastPlannerManager::checkTrajCollision(double& distance) {
 void FastPlannerManager::TopoPathReplan(Eigen::Vector3d start_pt, Eigen::Vector3d end_pt,
                                         Eigen::Vector3d start_yaw, vector<Eigen::Vector3d>& start_change)
 {
+    discardCandidatePlan();
     start_yaw(0) = Mod2Pi(start_yaw(0));
     ROS_INFO("[Topo]: ---------");
     plan_data_.clearTopoPaths();
@@ -315,9 +316,19 @@ void FastPlannerManager::TopoPathReplan(Eigen::Vector3d start_pt, Eigen::Vector3
     plan_data_.voronoi_paths_ = topo_prm_->getVoroPathsForPub();
     // plan_data_.topo_guide_path_ = topo_prm_->findDubinsShots(start_pt_forward, 0.5 * kino_path_finder_->getSteerRadius());
     vector<Eigen::Vector3d> path_pts_sprase;
-    plan_data_.topo_guide_path_ = topo_prm_->findGuidePath(start_pt_forward, path_pts_sprase);
+    candidate_plan_.guide_path = topo_prm_->findGuidePath(start_pt_forward, path_pts_sprase);
+    const TopologyGuideCandidate& guide_candidate =
+        topo_prm_->getPendingGuideCandidate();
+    if (!guide_candidate.valid || candidate_plan_.guide_path.empty()) {
+      ROS_WARN("[ECTS] No valid topology guide candidate was produced.");
+      return;
+    }
+    candidate_plan_.topology_path_id = guide_candidate.path_id;
+    candidate_plan_.from_topology_proposal =
+        guide_candidate.from_switch_proposal;
     plan_data_.topo_sample_area_ = topo_prm_->getSampleArea();
-    plan_data_.waypoint_ = topo_prm_->generateWayPoint(plan_data_.topo_guide_path_, start_pt);
+    candidate_plan_.waypoint =
+        topo_prm_->generateWayPoint(candidate_plan_.guide_path, start_pt);
 }
 
 
@@ -339,7 +350,8 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
 
   ros::Time t1, t2;
 
-  local_data_.start_time_ = ros::Time::now();
+  LocalTrajData& candidate_trajectory = candidate_plan_.trajectory;
+  candidate_trajectory.start_time_ = ros::Time::now();
   double t_search = 0.0, t_opt = 0.0, t_adjust = 0.0, t_topo = 0.0;;
 
   Eigen::Vector3d init_pos = start_pt;
@@ -362,11 +374,12 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   
   t_topo = (ros::Time::now() - t1).toSec();
   t1                    = ros::Time::now(); //更新当前时间
-  static vector<Eigen::Vector3d> guide_path_last;
-  if(!plan_data_.topo_guide_path_.empty()) guide_path_last = plan_data_.topo_guide_path_;
-  else ROS_WARN("[Topo]: No guide path found, using last one.");
+  if (candidate_plan_.guide_path.empty()) {
+    ROS_ERROR("[ECTS] CandidatePlan has no guide path.");
+    return false;
+  }
   kino_path_finder_->reset();
-  kino_path_finder_->setGuidePath(guide_path_last);
+  kino_path_finder_->setGuidePath(candidate_plan_.guide_path);
   int status = kino_path_finder_->search(start_pt, start_vel, start_acc, start_yaw(0), end_pt, end_vel, end_yaw(0), true);
   if (status == KinodynamicAstar::NO_PATH) 
   {
@@ -467,7 +480,7 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   if(save_info_) { saveBsplineInfo(init, "init"); }
   if(save_info_) { saveGeoPathInfo(plan_data_.kino_path_, "geo", delta_t_geo); }
   if(save_info_) { savePointsToFile(point_set, src_file + "path_sample.txt"); }
-  local_data_.position_traj_tmp_ = init;
+  candidate_trajectory.position_traj_tmp_ = init;
   //下面计算一下，开始和结尾两个控制点的连线方向是不是和规划的一样
   // std::cout << "ctrl_pts:\n" << ctrl_pts.matrix() << std::endl;
   int ctrl_pts_num = ctrl_pts.rows();
@@ -517,7 +530,7 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   // }
   { 
     auto traj_opt = NonUniformBspline(ctrl_pts, 3, ts);
-    local_data_.position_traj_tmp_ = traj_opt;
+    candidate_trajectory.position_traj_tmp_ = traj_opt;
     if(save_info_) saveBsplineInfo(traj_opt, "opt"); 
   }
   // Ctrl points yaw constraint
@@ -545,7 +558,7 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
     auto ctrl_pts_yaw_mid = bspline_optimizers_[5]->BsplineOptimizeTraj
                             (ctrl_pts_yaw_constr, ts, cost_function, 1, 1, fix_num_start, fix_num_end, 0);
     NonUniformBspline traj_yaw_mid(ctrl_pts_yaw_mid, 3, ts);
-    local_data_.position_traj_tmp_ = traj_yaw_mid;
+    candidate_trajectory.position_traj_tmp_ = traj_yaw_mid;
     if(save_info_) saveBsplineInfo(traj_yaw_mid, "yaw_constr");
     ctrl_pts = ctrl_pts_yaw_mid;
     opt_t4 = ros::Time::now();
@@ -609,7 +622,7 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   // }
 
   double to = pos.getTimeSum();
-  pos.setPhysicalLimits(1.05 * pp_.max_vel_, 1.1 * pp_.max_acc_); // 这里要加上一个尺度因子
+  pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_);
   bool feasible = pos.checkFeasibility(false);
 
   int iter_num = 0;
@@ -649,10 +662,11 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   if (tn / to > 3.0) ROS_ERROR("reallocate error.");
 
   t_adjust = (ros::Time::now() - t1).toSec();
-  double t_total_e = (ros::Time::now() - local_data_.start_time_).toSec();
+  double t_total_e =
+      (ros::Time::now() - candidate_trajectory.start_time_).toSec();
   // save planned results
 
-  local_data_.position_traj_ = pos;
+  candidate_trajectory.position_traj_ = pos;
 
   double t_total = t_search + t_opt + t_adjust;
   cout << "[kino replan]: total time [ms]: " << t_total_e * 1000 << ", topo: " << t_topo * 1000 << ", search: " << t_search * 1000 << ", optimize: " << t_opt * 1000
@@ -662,9 +676,20 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   pp_.time_optimize_ = t_opt;
   pp_.time_adjust_   = t_adjust;
 
-  updateTrajInfo();
+  updateTrajInfo(candidate_trajectory, local_data_.traj_id_ + 1);
+  candidate_plan_.planning_success = true;
+  candidate_plan_.collision_valid = validateCandidateCollision(pos);
+  validateCandidateDynamics(candidate_plan_);
 
-  return true;
+  if (!candidate_plan_.collision_valid) {
+    ROS_ERROR("Reject invalid CandidatePlan: trajectory is in collision");
+  }
+  if (!candidate_plan_.velocity_valid ||
+      !candidate_plan_.acceleration_valid) {
+    ROS_ERROR("Reject invalid CandidatePlan: trajectory violates velocity or acceleration limits");
+  }
+
+  return candidate_plan_.valid();
 }
 
 // !SECTION
@@ -1022,11 +1047,89 @@ void FastPlannerManager::findCollisionRange(vector<Eigen::Vector3d>& colli_start
 // 将当前计算出来的路径结果更新local_data_
 // 具体地、更新轨迹、速度、加速度、起点、时间周期和轨迹编号
 void FastPlannerManager::updateTrajInfo() {
-  local_data_.velocity_traj_     = local_data_.position_traj_.getDerivative();
-  local_data_.acceleration_traj_ = local_data_.velocity_traj_.getDerivative();
-  local_data_.start_pos_         = local_data_.position_traj_.evaluateDeBoorT(0.0);
-  local_data_.duration_          = local_data_.position_traj_.getTimeSum();//整一条轨迹的耗时？
-  local_data_.traj_id_ += 1;
+  updateTrajInfo(local_data_, local_data_.traj_id_ + 1);
+}
+
+void FastPlannerManager::updateTrajInfo(LocalTrajData& trajectory,
+                                        int traj_id) {
+  trajectory.velocity_traj_ = trajectory.position_traj_.getDerivative();
+  trajectory.acceleration_traj_ = trajectory.velocity_traj_.getDerivative();
+  trajectory.start_pos_ = trajectory.position_traj_.evaluateDeBoorT(0.0);
+  trajectory.duration_ = trajectory.position_traj_.getTimeSum();
+  trajectory.traj_id_ = traj_id;
+}
+
+bool FastPlannerManager::validateCandidateCollision(
+    NonUniformBspline trajectory) {
+  const double duration = trajectory.getTimeSum();
+  const auto collision_free_at = [this, &trajectory](double sample_time) {
+    Eigen::Vector3d point = trajectory.evaluateDeBoorT(sample_time);
+    const double environment_time = pp_.dynamic_ ? sample_time : -1.0;
+    if (edt_environment_->evaluateCoarseEDT(
+            point, environment_time, this->only2D()) < pp_.clearance_) {
+      return false;
+    }
+    return true;
+  };
+
+  for (double t = 0.0; t < duration; t += 0.02) {
+    if (!collision_free_at(t)) return false;
+  }
+  return collision_free_at(duration);
+}
+
+void FastPlannerManager::validateCandidateDynamics(CandidatePlan& candidate) {
+  NonUniformBspline velocity_check = candidate.trajectory.position_traj_;
+  velocity_check.setPhysicalLimits(
+      pp_.max_vel_, std::numeric_limits<double>::max());
+  candidate.velocity_valid = velocity_check.checkFeasibility(false);
+
+  NonUniformBspline acceleration_check = candidate.trajectory.position_traj_;
+  acceleration_check.setPhysicalLimits(
+      std::numeric_limits<double>::max(), pp_.max_acc_);
+  candidate.acceleration_valid = acceleration_check.checkFeasibility(false);
+}
+
+bool FastPlannerManager::commitCandidatePlan(
+    const Eigen::Vector3d& start_yaw,
+    const Eigen::Vector3d& end_yaw) {
+  if (!candidate_plan_.valid()) {
+    return false;
+  }
+
+  // Yaw is part of the candidate trajectory and must be complete before any
+  // active state is changed.
+  planYawForTrajectory(candidate_plan_.trajectory, start_yaw, end_yaw);
+
+  // The pending topology is rechecked immediately before the single-threaded
+  // commit. A failed recheck leaves all active state untouched.
+  if (!topo_prm_->commitPendingGuideCandidate()) {
+    ROS_WARN("Reject CandidatePlan: pending topology is no longer valid");
+    return false;
+  }
+
+  local_data_ = candidate_plan_.trajectory;
+  plan_data_.topo_guide_path_ = candidate_plan_.guide_path;
+  plan_data_.waypoint_ = candidate_plan_.waypoint;
+  topo_prm_->logEctsEvent("COMMIT_SUCCESS", true, true, true);
+  candidate_plan_.reset();
+  return true;
+}
+
+void FastPlannerManager::rejectCandidatePlan() {
+  const bool planning_success = candidate_plan_.planning_success;
+  const bool candidate_valid = candidate_plan_.valid();
+  if (topo_prm_) {
+    topo_prm_->recordCandidateRejected();
+    topo_prm_->logEctsEvent("CANDIDATE_REJECTED", planning_success,
+                            candidate_valid, false, true);
+  }
+  discardCandidatePlan();
+}
+
+void FastPlannerManager::discardCandidatePlan() {
+  if (topo_prm_) topo_prm_->discardPendingGuideCandidate();
+  candidate_plan_.reset();
 }
 
 
@@ -1036,10 +1139,16 @@ void FastPlannerManager::updateTrajInfo() {
 // 在优化阶段，用中间的yaw当作waypoints来引导
 // 这么做的目的是防止smooth项来yaw角全部拉平
 void FastPlannerManager::planYaw(const Eigen::Vector3d& start_yaw, const Eigen::Vector3d& end_yaw_traj) {
+  planYawForTrajectory(local_data_, start_yaw, end_yaw_traj);
+}
+
+void FastPlannerManager::planYawForTrajectory(
+    LocalTrajData& trajectory, const Eigen::Vector3d& start_yaw,
+    const Eigen::Vector3d& end_yaw_traj) {
   // ROS_INFO("plan yaw");
   auto t1 = ros::Time::now();
   // calculate waypoints of heading
-  auto&  pos      = local_data_.position_traj_;
+  auto&  pos      = trajectory.position_traj_;
   double duration = pos.getTimeSum();
 
   double dt_yaw  = 0.3;
@@ -1090,7 +1199,8 @@ void FastPlannerManager::planYaw(const Eigen::Vector3d& start_yaw, const Eigen::
       dt_yaw, (1 / 3.0) * dt_yaw * dt_yaw;
   yaw.block(0, 0, 3, 1) = states2pts * Eigen::Vector3d(last_yaw, 0.0, 0.0);
 
-  Eigen::Vector3d end_v = local_data_.velocity_traj_.evaluateDeBoorT(duration - 0.1);
+  Eigen::Vector3d end_v =
+      trajectory.velocity_traj_.evaluateDeBoorT(duration - 0.1);
   Eigen::Vector3d end_yaw(atan2(end_v(1), end_v(0)), 0, 0);
   // 注意这里end_yaw直接用外部输入的了
   end_yaw = end_yaw_traj;
@@ -1107,14 +1217,14 @@ void FastPlannerManager::planYaw(const Eigen::Vector3d& start_yaw, const Eigen::
     double delta_t = duration / (seg_num + 3 - 1);
     for(double t = 0; t <= duration + 1e-5; t += delta_t)
     {
-      yaw_dot_constraints.push_back(local_data_.velocity_traj_.evaluateDeBoorT(t).norm() * tan(60 / 57.3) / 0.6);
+      yaw_dot_constraints.push_back(trajectory.velocity_traj_.evaluateDeBoorT(t).norm() * tan(60 / 57.3) / 0.6);
       // yaw_dot_constraints.push_back(std::numeric_limits<double>::max());
       // std::cout << yaw_dot_constraints.back() << std::endl;
     }
   }
   std::vector<double> yaw_dot_desire_curve;
   string yaw_dot_desire_file = string(src_file + "angle_vel_constr.txt");
-  NonUniformBspline  vel      = local_data_.position_traj_.getDerivative();
+  NonUniformBspline  vel      = trajectory.position_traj_.getDerivative();
   double t_duration = vel.getTimeSum();
   for(double t = 0; t < t_duration + 1e-5; t += 0.05)
   {
@@ -1151,9 +1261,9 @@ void FastPlannerManager::planYaw(const Eigen::Vector3d& start_yaw, const Eigen::
   }
 
   // update traj info
-  local_data_.yaw_traj_.setUniformBspline(yaw, 3, dt_yaw);
-  local_data_.yawdot_traj_    = local_data_.yaw_traj_.getDerivative();
-  local_data_.yawdotdot_traj_ = local_data_.yawdot_traj_.getDerivative();
+  trajectory.yaw_traj_.setUniformBspline(yaw, 3, dt_yaw);
+  trajectory.yawdot_traj_    = trajectory.yaw_traj_.getDerivative();
+  trajectory.yawdotdot_traj_ = trajectory.yawdot_traj_.getDerivative();
 
 
   vector<double> path_yaw;
@@ -1165,9 +1275,9 @@ void FastPlannerManager::planYaw(const Eigen::Vector3d& start_yaw, const Eigen::
   // 这个地方应该不用打开。如果打开的话，虽然yaw角更平滑了，但是其实就跟不上轨迹了？
   if(opt2_succ != 0)
   {
-    local_data_.yaw_traj_.setUniformBspline(yaw_origin, 3, dt_yaw);
-    local_data_.yawdot_traj_    = local_data_.yaw_traj_.getDerivative();
-    local_data_.yawdotdot_traj_ = local_data_.yawdot_traj_.getDerivative();
+    trajectory.yaw_traj_.setUniformBspline(yaw_origin, 3, dt_yaw);
+    trajectory.yawdot_traj_    = trajectory.yaw_traj_.getDerivative();
+    trajectory.yawdotdot_traj_ = trajectory.yawdot_traj_.getDerivative();
   }
 
   // std::cout << "[plan yaw] plan heading: " << (ros::Time::now() - t1).toSec() << ", last yaw: " << last_yaw << ", use FeasYAW: " << opt2_succ << std::endl;

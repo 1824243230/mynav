@@ -91,9 +91,17 @@ private:
   int waypoint_num_;//手动设置的waypoint数目，如果target_type_是2的话，就会执行这些waypoint
 
   /* planning data */
-  bool trigger_, have_target_, have_odom_;
+  bool trigger_ = false;
+  bool have_target_ = false;
+  bool have_odom_ = false;
+  bool planning_busy_ = false;
+  bool replan_pending_ = false;
+  bool active_trajectory_unsafe_ = false;
+  bool topology_reset_pending_ = false;
   bool use_kino_replan_ = true;         // 这个标记为true，使用混合A*规划；否则，使用cmu_planner，要关闭掉一些东西，比如对轨迹的碰撞检测           
-  double last_plan_time_;
+  double last_plan_time_ = 0.0;
+  double planning_retry_interval_ = 0.5;
+  ros::WallTime last_planning_attempt_wall_time_;
   bool use_teb_ = false;
   FSM_EXEC_STATE exec_state_;
 
@@ -118,6 +126,11 @@ private:
   ros::Publisher waypoint_pub_;
   /* helper functions */
   bool callKinodynamicReplan();        // front-end and back-end method
+  bool tryPlanningAttempt(bool& success);
+  void finishPlanningAttempt(bool success, bool initial_attempt);
+  bool pendingReplanStillRequired() const;
+  void requestReplan(bool emergency_stop, const string& source);
+  bool planningRetryReady() const;
   bool callTopologicalTraj(int step);  // topo path guided gradient-based
                                        // optimization; 1: new, 2: replan
   void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);

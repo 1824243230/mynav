@@ -51,13 +51,13 @@ bool traj_record_switch_ = false;
 bool is_storing_ = false;
 std::ofstream traj_cmd_file_, traj_real_file_; 
 vector<NonUniformBspline> traj_;
-double traj_duration_;
-ros::Time start_time_;
-int traj_id_;
+double traj_duration_ = 0.0;
+ros::Time start_time_(0);
+int traj_id_ = 0;
 
 // yaw control
-double last_yaw_;
-double time_forward_;
+double last_yaw_ = 0.0;
+double time_forward_ = 0.0;
 //traj_real_存放的是所有的历史轨迹，traj_cmd_存放的是所有的历史期望轨迹
 vector<Eigen::Vector3d> traj_cmd_, traj_real_;
 
@@ -212,8 +212,11 @@ void bsplineCallback(plan_manage::BsplineConstPtr msg) {
   receive_traj_ = true;
 }
 
-//重置时间
+// /planning/replan is reserved for emergency invalidation of a trajectory
+// that has already been confirmed unsafe. Normal replanning never publishes
+// this message and replaces the trajectory atomically through bsplineCallback.
 void replanCallback(std_msgs::Empty msg) {
+  if (!receive_traj_) return;
   /* reset duration */
   const double time_out = 0.01;
   ros::Time time_now = ros::Time::now();
@@ -262,8 +265,12 @@ void cmdCallback(const ros::TimerEvent& e) {
   // 为什么要计算当前的这个pos？这是当前时间的轨迹的位置，也就是期望的？为什么不向前计算一点？
   // 因为轨迹就是带时间的，只要每个周期都执行好当前的就可以了。
 
-  Eigen::Vector3d pos, vel, acc, pos_f;
-  double yaw, yawdot;
+  Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+  Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+  Eigen::Vector3d acc = Eigen::Vector3d::Zero();
+  Eigen::Vector3d pos_f = Eigen::Vector3d::Zero();
+  double yaw = last_yaw_;
+  double yawdot = 0.0;
 
   if (t_cur < traj_duration_ && t_cur >= 0.0) {
     pos = traj_[0].evaluateDeBoorT(t_cur);

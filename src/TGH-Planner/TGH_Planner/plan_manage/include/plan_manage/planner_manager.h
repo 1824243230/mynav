@@ -62,6 +62,11 @@ public:
 
   //yaw角单独规划，规划的结果放到local_data_里面
   void planYaw(const Eigen::Vector3d& start_yaw, const Eigen::Vector3d& end_yaw = Eigen::Vector3d::Zero());//
+  bool commitCandidatePlan(const Eigen::Vector3d& start_yaw,
+                           const Eigen::Vector3d& end_yaw = Eigen::Vector3d::Zero());
+  void rejectCandidatePlan();
+  void discardCandidatePlan();
+  bool hasActivePlan() const { return local_data_.traj_id_ > 0; }
 
   void initPlanModules(ros::NodeHandle& nh);//初始化规划的模块
   void setGlobalWaypoints(vector<Eigen::Vector3d>& waypoints);//topo用
@@ -69,6 +74,7 @@ public:
   bool checkTrajCollision(double& distance);
 
   LocalTrajData local_data_;   //存放的是最近一次规划的结果，位置和yaw角的0阶导、1阶导、2阶导都用B样条曲线表示
+  CandidatePlan candidate_plan_;  // pending only; never consumed by the controller before commit
   GlobalTrajData global_data_; //给topo用的
 
   PlanParameters pp_;                       // 规划相关的参数
@@ -99,6 +105,12 @@ private:
   string src_file = "xx/";
   std::ofstream record_file_;
   void updateTrajInfo();//
+  void updateTrajInfo(LocalTrajData& trajectory, int traj_id);
+  void planYawForTrajectory(LocalTrajData& trajectory,
+                            const Eigen::Vector3d& start_yaw,
+                            const Eigen::Vector3d& end_yaw);
+  bool validateCandidateCollision(NonUniformBspline trajectory);
+  void validateCandidateDynamics(CandidatePlan& candidate);
 
   // topology guided optimization
 

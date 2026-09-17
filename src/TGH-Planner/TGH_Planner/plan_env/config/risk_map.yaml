@@ -22,6 +22,16 @@ risk_aware_path_selector:
   orientation_tie_threshold: 0.01
   sample_resolution: 0.1
 
+ects:
+  enabled: true
+  use_fixed_scale_score: true
+  length_ref: 1.0
+  risk_ref: 1.0
+  prs_ref: 1.0
+  lambda_switch: 1.0
+  switch_margin: 0.0
+  dubins_ref: 1.0
+
 # Path Reliability Score evaluator and final candidate-ranking weights.
 path_reliability:
   enable: true

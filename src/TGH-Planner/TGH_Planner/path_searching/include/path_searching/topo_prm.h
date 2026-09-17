@@ -30,6 +30,7 @@
 #include <plan_env/raycast.h>
 #include <random>
 #include <array>
+#include <string>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <std_msgs/ColorRGBA.h>
@@ -55,7 +56,9 @@ public:
   std::vector<RiskEdge> risk_edges;
   bool safty = true;
   std::pair<vector<Eigen::Vector3d>, vector<Eigen::Vector3d>> path_break = {}; // first是从起点到断点的路径，second是从断点到终点的路径
-  bool selected = false; // 是否是当前正被选中作为引导路径的，path container里面只允许一个true
+  // True only for the topology owned by the committed ACTIVE plan. Proposal
+  // and Candidate paths must remain false until atomic commit.
+  bool selected = false;
   PATH_STATE state = AFFECTED;
   uint64_t validated_map_revision = 0;
   uint64_t geometry_version = 0;
@@ -80,6 +83,42 @@ struct TopologicalPathCost {
   double length = 0.0;
   double risk = 0.0;
   double total_cost = std::numeric_limits<double>::infinity();
+};
+
+struct TopologySwitchProposal {
+  bool valid = false;
+  uint64_t active_path_id = 0;
+  uint64_t challenger_path_id = 0;
+  std::vector<Eigen::Vector3d> challenger_path;
+  TopologySwitchDecision decision;
+};
+
+struct TopologyGuideCandidate {
+  bool valid = false;
+  bool from_switch_proposal = false;
+  uint64_t path_id = 0;
+  std::vector<Eigen::Vector3d> sparse_path;
+  std::vector<Eigen::Vector3d> guide_path;
+};
+
+struct EctsDiagnostics {
+  std::string active = "none";
+  std::string keep = "none";
+  std::string challenger = "none";
+  double keep_cost = std::numeric_limits<double>::infinity();
+  double challenger_cost = std::numeric_limits<double>::infinity();
+  double gain = -std::numeric_limits<double>::infinity();
+  double keep_dubins_length = std::numeric_limits<double>::infinity();
+  double challenger_dubins_length = std::numeric_limits<double>::infinity();
+  double connection_penalty = 0.0;
+  double margin = -std::numeric_limits<double>::infinity();
+};
+
+struct EctsCounters {
+  uint64_t topology_switch_count = 0;
+  uint64_t topology_reversal_count = 0;
+  uint64_t candidate_reject_count = 0;
+  uint64_t commit_count = 0;
 };
 
 struct RecordData {
@@ -309,9 +348,22 @@ private:
   size_t reused_history_paths_ = 0;
   size_t invalidated_history_paths_ = 0;
   size_t hec_check_count_ = 0;
+  double dubins_turning_radius_ = 1.0;
+  bool active_topology_invalid_ = false;
+  uint64_t invalid_active_path_id_ = 0;
+  std::vector<Eigen::Vector3d> invalid_active_path_;
+  TopologySwitchProposal pending_proposal_;
+  TopologyGuideCandidate pending_guide_candidate_;
+  EctsDiagnostics ects_diagnostics_;
+  EctsCounters ects_counters_;
+  // The topology immediately preceding the current distinct committed
+  // topology. It is used only to count A -> B -> A reversals.
+  std::vector<Eigen::Vector3d> previous_committed_topology_path_;
 
   bool pathIntersectsDirtyRegion(const std::vector<Eigen::Vector3d>& path,
                                  const DynaVoro::MapChangeSet& changes) const;
+  void checkSelectedInvariant(const char* context) const;
+  void invalidateSelectedTopology(TopoPath& path, const char* reason);
 public:
   double clearance_;
   double clearance_line_;
@@ -353,10 +405,21 @@ public:
   }
   void CommonStartEnd(const std::vector<Eigen::Vector3d>& vec1, 
                       const std::vector<Eigen::Vector3d>& vec2, int& sameStart, int& sameEnd);
-  void findDubinsShot(const vector<Eigen::Vector3d>& path, const int& path_id,
-                      const Eigen::Vector3d& start_state, const double& radius);
+  double findDubinsShot(const vector<Eigen::Vector3d>& path, const int& path_id,
+                        const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findDubinsShots(const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase);
+  const TopologySwitchProposal& getPendingProposal() const { return pending_proposal_; }
+  const TopologyGuideCandidate& getPendingGuideCandidate() const {
+    return pending_guide_candidate_;
+  }
+  bool commitPendingGuideCandidate();
+  void discardPendingGuideCandidate();
+  void recordCandidateRejected();
+  void logEctsEvent(const std::string& decision, bool planning_success,
+                    bool candidate_valid, bool commit,
+                    bool throttle = false) const;
+  EctsCounters getEctsCounters() const { return ects_counters_; }
   vector<vector<Eigen::Vector3d>> getPathContainer(const int& label = 0);
   vector<TopologicalPathCost> getPathCosts(const int& label = 0) const;
   void preprocess();
