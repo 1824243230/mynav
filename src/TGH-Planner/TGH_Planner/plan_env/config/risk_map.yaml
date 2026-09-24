@@ -1,36 +1,73 @@
 risk_map:
   risk_enable: true
+
+  # d_safe = 1.2 * robot_width = 0.6 m
+  # distance risk at d_safe ≈ 1.5
   lambda_distance: 1.0
-  lambda_corridor: 1.0
-  lambda_unknown: 1.0
+
+  # safe corridor width = 2 * robot_width = 1.0 m
+  # corridor risk at w_safe ≈ 2.0
+  lambda_corridor: 0.5
+
+  # unknown-region additional penalty
+  lambda_unknown: 0.5
+
   robot_width: 0.5
 
+
 risk_aware_graph:
+
+  # Reference:
+  # L_ref = 10 m
+  # R_ref = 5
+  # turn_ref = 0.5 rad
+
   alpha: 1.0
-  beta: 1.0
-  # gamma=0 keeps J(path)=alpha*L+beta*R exactly; increase it to penalize turns.
-  gamma: 0.0
+  beta: 0.40
+  gamma: 0.50
+
   edge_sample_resolution: 0.1
 
+
 risk_aware_path_selector:
-  # Cost = w1 * normalized_length - w2 * normalized_risk (larger is better).
+
+  # normalized score:
+  # length : risk = 1 : 2
   w1: 1.0
-  w2: 1.0
-  high_risk_threshold: 5.0
+  w2: 1.5
+
+  # Theoretical high-risk boundary
+  high_risk_threshold: 15.0
+
+  # 4 * robot_width
   open_space_width_threshold: 2.0
-  dynamic_weight_gain: 0.0
-  orientation_tie_threshold: 0.01
+  # moderate adaptive weighting
+  dynamic_weight_gain: 0.2
+
+  orientation_tie_threshold: 0.03
+
   sample_resolution: 0.1
 
-# Path Reliability Score evaluator and final candidate-ranking weights.
+
 path_reliability:
   enable: true
-  lambda_length: 1.0
+
+  # Final ranking
+  lambda_length: 2.0
   lambda_risk: 1.0
-  lambda_prs: 1.0
-  alpha: 1.0
-  beta: 1.0
-  gamma: 1.0
+  lambda_prs: 0.5
+
+  # exp(-alpha * 5) ≈ 0.5
+  alpha: 0.14
+
+  # assuming clearance_risk normalized to [0,1]
+  beta: 0.69
+
+  # assuming risk_variance critical value ≈ 4
+  gamma: 0.17
+
   epsilon: 0.001
+
   sample_resolution: 0.1
+
   debug_output: true

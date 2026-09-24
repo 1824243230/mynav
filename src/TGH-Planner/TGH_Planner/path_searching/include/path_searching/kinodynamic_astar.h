@@ -29,17 +29,17 @@ class PathNode {
       FORWARD = 0, BACKWARD = 1, NO = 3
   };
   /* -------------------- */
-  Eigen::Vector3i index;
-  Eigen::Matrix<double, 6, 1> state;//3D：三维的位置和三维速度；2D：二维的位置、yaw(-pi, pi)和速度标量（有正负）和前进or后退（使用5个数）
+  Eigen::Vector3i index;             // 混合 A* 中为离散的 (x_index,y_index,yaw_index)
+  Eigen::Matrix<double, 6, 1> state;//3D：三维的位置和三维速度；2D：前四维为连续的(x,y,yaw,标量速度)
   // std::vector<Eigen::Matrix<double, 6, 1>> intermediate_state; //这个是给2D用的
   DIRECTION direction;              // 前进or后退，需要这个吗？
   int steering_grade;              // 转向，范围是[-steering_discrete_num_, steering_discrete_num_]，0表示直线
-  double g_score, f_score;
-  Eigen::Vector3d input;            //3D：三维加速度；2D：速度标量（有正负）和转向角度
-  double duration;                  //上节点到该节点这一段的时间
+  double g_score, f_score;          // A* 累计代价 g，以及 g + lambda * h
+  Eigen::Vector3d input;            //3D：三维加速度；2D：前两维为速度标量和前轮转角
+  double duration;                  //父节点到该节点的运动原语持续时间
   double time;                      // 和dyn有关
   int time_idx;                     // 很dyn有关
-  PathNode* parent;
+  PathNode* parent;                 // 搜索成功后据此回溯路径
   char node_state;                  // IN_OPEN_SET、NOT_EXPAND、IN_CLOSE_SET
 
   vector<Eigen::Matrix<double, 6, 1>> mid_states_;// 扩展过程中的状态，用来看search_tree. tau=1.0， dt = 0.1时，mid_state的size是11
@@ -57,6 +57,7 @@ typedef PathNode* PathNodePtr;
 class NodeComparator {
  public:
   bool operator()(PathNodePtr node1, PathNodePtr node2) {
+    // std::priority_queue 默认最大堆，使用 > 后可让 f_score 最小的节点位于堆顶。
     return node1->f_score > node2->f_score;
   }
 };
@@ -86,6 +87,7 @@ class NodeHashTable {
   NodeHashTable(/* args */) {}
   ~NodeHashTable() {}
   void insert(Eigen::Vector3i idx, PathNodePtr node) {
+    // 离散状态只保存一份节点，避免连续运动原语反复落入同一搜索栅格。
     data_3d_.insert(std::make_pair(idx, node));
   }
   void insert(Eigen::Vector3i idx, int time_idx, PathNodePtr node) {

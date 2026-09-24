@@ -365,6 +365,8 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   static vector<Eigen::Vector3d> guide_path_last;
   if(!plan_data_.topo_guide_path_.empty()) guide_path_last = plan_data_.topo_guide_path_;
   else ROS_WARN("[Topo]: No guide path found, using last one.");
+  // 混合 A* 在此接入规划流水线：Guide Path 仅影响启发项，起终点状态和
+  // ESDF 地图共同决定搜索结果。search() 返回状态码，轨迹稍后由 getKinoTraj() 取出。
   kino_path_finder_->reset();
   kino_path_finder_->setGuidePath(guide_path_last);
   int status = kino_path_finder_->search(start_pt, start_vel, start_acc, start_yaw(0), end_pt, end_vel, end_yaw(0), true);

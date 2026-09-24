@@ -51,6 +51,7 @@ double Mod2Pi(const double &x) {
 }
 
 std::vector<double> computePathDis(const std::vector<Eigen::Vector3d>& path) {
+    // distances[i] 表示从引导路径第 i 个点沿折线走到终点的剩余长度。
     std::vector<double> distances(path.size(), 0.0);
     // 从倒数第二个点开始，往前累加路径距离
     for (int i = path.size() - 2; i >= 0; --i) {
@@ -79,6 +80,7 @@ KinodynamicAstar2D::~KinodynamicAstar2D()
 int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v, Eigen::Vector3d start_a, double start_yaw,
                                Eigen::Vector3d end_pt, Eigen::Vector3d end_v, double end_yaw, bool init, bool dynamic, double time_start, bool gen_search)
 {
+  // 阶段 1：预处理上层拓扑 Guide Path，建立最近邻索引，供启发函数 h 使用。
   // // ------------现在用topo路径替换JPS来做搜索引导，但是依然使用jps_path_finder_里面的辅助函数--------
   if(topo_path_.size() >= 2)
   {
@@ -112,6 +114,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
   start_vel_ = start_v;
   start_acc_ = start_a;
   ground_height_ = start_pt(2);
+  // 阶段 2：构造 A* 起点。二维车辆状态的有效分量为 [x, y, yaw, speed]。
   PathNodePtr cur_node = path_node_pool_[0];
   cur_node->parent = NULL;
   cur_node->state.head(2) = start_pt.head(2);
@@ -134,6 +137,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
   end_state(2) = end_yaw;
   end_state(3) = end_v.norm();
   end_index = stateToIndex(end_state.head(3));
+  // A* 评价函数 f(n)=g(n)+lambda*h(n)，lambda>1 时属于加权 A*。
   cur_node->f_score = lambda_heu_ * estimateHeuristic(cur_node->state, end_state, time_to_goal) + 0.0;
   cur_node->node_state = IN_OPEN_SET;
   open_set_.push(cur_node);
@@ -161,7 +165,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
 
   vector<Eigen::Matrix<double, 6, 1>> mid_states_tmp;
   mid_states_tmp.resize(mid_states_size_);
-  // main loop
+  // 阶段 3：A* 主循环，每次从 OPEN 集取 f 最小的节点。
   while (!open_set_.empty())
   {
     cur_node = open_set_.top();
@@ -228,6 +232,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
     }
 
     open_set_.pop();
+    // 被选中扩展的节点进入 CLOSED 集，之后不再重新打开。
     cur_node->node_state = IN_CLOSE_SET;
     iter_num_ += 1;
 
@@ -277,7 +282,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
       // durations.push_back(0.5 * max_tau_);
     }
 
-    // 扩展节点
+    // 阶段 4：枚举离散转角、速度方向和持续时间，生成运动学可行的曲线运动原语。
     // cout << "cur state:" << cur_state.head(3).transpose() << endl;
     for (int i = 0; i < inputs.size(); ++i)
       for (int j = 0; j < durations.size(); ++j)
@@ -286,7 +291,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
         double tau = durations[j];
         if(std::abs(um(1)) > 40/57.3) tau = static_cast<int>(floor(5 * init_max_tau_)) * 0.1;///----待修改!!
 
-        // Check safety，同时也计算出最后的状态
+        // 沿整条运动原语以 expand_time_ 积分并查询 ESDF，不能只检查末端节点。
         // 是不是要对这个检查是否在地图内？
         Eigen::Vector2d pos;
         Eigen::Matrix<double, 6, 1> x0, xt;
@@ -339,7 +344,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
         }
 
 
-        //前面的check都通过了，说明这个neighbor node是合格的
+        // 阶段 5：计算候选节点累计代价 g 和优先级 f=g+lambda*h。
         double time_to_goal, tmp_g_score, tmp_f_score;
         tmp_g_score = estimateG(cur_state, cur_node->steering_grade, pro_state, tmp_steering_grade, tau);
         tmp_g_score += cur_node->g_score;
@@ -376,7 +381,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
         // This node end up in a voxel different from others
         if (!prune)
         {
-          //如果该次扩展的节点不在之前expanded_nodes_里面，是新访问的，则新建
+          // 新离散状态：从预分配池取节点，记录父指针，并加入 OPEN 集和哈希表。
           if (pro_node == NULL)
           {
             pro_node = path_node_pool_[use_node_num_];
@@ -416,7 +421,7 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
               return NO_PATH;
             }
           }
-          // 如果这个节点是在OPEN SET里面，且状态更好，则更新
+          // 已在 OPEN 集且新路径的 g 更小：执行 A* 松弛并改写父指针。
           // 注意，这里不是用现在的节点替换掉之前在open set里面的节点，而是直接修改之前节点的状态和参数
           else if (pro_node->node_state == IN_OPEN_SET)
           {
@@ -529,6 +534,8 @@ void KinodynamicAstar2D::retrievePath(PathNodePtr end_node)
 //这个按照深蓝学院课程第四章推导就有了
 double KinodynamicAstar2D::estimateHeuristic(Eigen::VectorXd x1, Eigen::VectorXd x2, double& optimal_time)
 {
+  // 无引导路径时先用欧氏距离；进入目标附近后改用满足最小转弯半径的
+  // Dubins 距离，因此 h 同时考虑位置、航向和车辆非完整约束。
   double h, h_topo = 0.0;
   h = (x1.head(2) - x2.head(2)).lpNorm<2>();
   // TODO: REVERSE  
@@ -563,6 +570,9 @@ double KinodynamicAstar2D::estimateHeuristic(Eigen::VectorXd x1, Eigen::VectorXd
   // 这里的H项还需要进一步设计
   if(topo_path_.size() >= 2)
   {
+    // 有 Guide Path 时：h = 沿引导路径到目标的剩余长度
+    //                     + 当前状态偏离引导路径的横向距离惩罚。
+    // 该项只改变节点排序，不强制轨迹必须经过引导点。
     std::vector<int> pointIdxNKNSearch(1);
     std::vector<float> pointNKNSquaredDistance(1);
     pcl::PointXY queryPoint;
@@ -592,6 +602,8 @@ double KinodynamicAstar2D::estimateHeuristic(Eigen::VectorXd x1, Eigen::VectorXd
 
 bool KinodynamicAstar2D::computeShotTraj(Eigen::VectorXd state1, Eigen::VectorXd state2, double time_to_goal)
 {
+  // estimateHeuristic() 已用当前状态和目标状态初始化 path_；这里逐段采样做
+  // 地图边界及安全距离检查，全部通过后才把 Dubins 段拼入最终输出。
   double length = dubins_path_length(&path_);
   double x = 0.0;
   double move_step_size = resolution_;
@@ -658,6 +670,7 @@ void KinodynamicAstar2D::setEnvironment(const EDTEnvironment::Ptr& env)
 //每次在规划的时候都需要先reset，所以这个地方一定要高效
 void KinodynamicAstar2D::reset()
 {
+  // 保留预分配内存与上一条 topo_path_，只清理本轮状态，降低在线重规划开销。
   expanded_nodes_.clear();//使用这种形式更加高效
   path_nodes_.clear();
   // topo_path_.clear();  //不要直接clear，有时候这一次找不到引导路径，还可以用上次的
@@ -681,6 +694,7 @@ void KinodynamicAstar2D::reset()
 // 感觉这里就很呆，为什么不用原代码里面地扩展方式？得到地还是多项式，挺方便。或者先拟合为五次多项式也挺好啊
 std::vector<Eigen::Vector3d> KinodynamicAstar2D::getKinoTraj(double& delta_t)
 {
+  // search() 只返回状态码；实际轨迹由本函数从 path_nodes_ 和 path_ 重建。
   vector<Vector3d> state_list;      //总的
   vector<Vector3d> state_list_tmp;  //每一个搜索扩展的
   /* ---------- get traj of searching ---------- */
@@ -921,6 +935,7 @@ vector<Vector4d> KinodynamicAstar2D::getSearchTree()
 
 Eigen::Vector3i KinodynamicAstar2D::stateToIndex(Eigen::Vector3d state)
 {
+  // 连续状态保留在 PathNode::state 中；仅判重和哈希使用离散索引。
   Vector3i idx;
   idx[0] = ((state[0] - origin_(0)) * inv_resolution_);
   idx[1] = ((state[1] - origin_(1)) * inv_resolution_);
@@ -954,6 +969,8 @@ int KinodynamicAstar2D::timeToIndex(double time)
 void KinodynamicAstar2D::stateTransit(Eigen::Matrix<double, 6, 1>& state0, Eigen::Matrix<double, 6, 1>& state1,
                                       Eigen::Vector2d um, double tau)
 {
+  // 运动学自行车模型：x_dot=v*cos(yaw), y_dot=v*sin(yaw),
+  // yaw_dot=v*tan(steer)/wheel_base；这里使用一阶欧拉积分。
   Eigen::Vector3d dot_s(um(0) * cos(state0(2)), um(0) * sin(state0(2)), um(0) * tan(um(1)) / wheel_base_);
 
   state1.head(3) = state0.head(3) + dot_s * tau;
@@ -964,6 +981,7 @@ void KinodynamicAstar2D::stateTransit(Eigen::Matrix<double, 6, 1>& state0, Eigen
 double KinodynamicAstar2D::estimateG(const Eigen::Matrix<double, 6, 1>& state0, const int & steering0,
                                      const Eigen::Matrix<double, 6, 1>& state1, const int & steering1,
                                      double ts) const {
+    // 基础代价为速度乘持续时间；转弯和改变转角会叠加惩罚。
     double g;
     // if (neighbor_node_ptr->direction == PathNode::FORWARD) 
     {
