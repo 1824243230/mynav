@@ -31,6 +31,10 @@ risk_aware_graph:
 
 risk_aware_path_selector:
 
+  # TCBS is opt-in; disabled preserves the legacy path selector.
+  enable_tcbs: false
+  eta_switch: 0.15
+
   # normalized score:
   # length : risk = 1 : 2
   w1: 1.0

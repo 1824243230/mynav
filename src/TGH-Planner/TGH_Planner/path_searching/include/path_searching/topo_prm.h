@@ -52,6 +52,7 @@ public:
   double risk = 0.0;
   double curvature_cost = 0.0;
   double total_cost = std::numeric_limits<double>::max();
+  TCBSScore tcbs_score;
   std::vector<RiskEdge> risk_edges;
   bool safty = true;
   std::pair<vector<Eigen::Vector3d>, vector<Eigen::Vector3d>> path_break = {}; // first是从起点到断点的路径，second是从断点到终点的路径
@@ -261,6 +262,11 @@ private:
   int shortestPath(vector<vector<Eigen::Vector3d>>& paths);
   RiskPathCost evaluatePathCost(const vector<Eigen::Vector3d>& path) const;
   void updatePathCost(TopoPath& path);
+  bool isBetterTCBSCandidate(const TopoPath& candidate,
+                             const TopoPath* best) const;
+  void findBestTCBSCandidates(const vector<TopoPath*>& candidates,
+                              int& keep_index,
+                              int& challenger_index);
   void logPathCosts() const;
 
   //QHB: For 2D
@@ -302,6 +308,31 @@ private:
   std::vector<Eigen::Vector3d> colli_pts_;
   std::vector<Eigen::Vector3d> start_change_;
   std::vector<Eigen::Vector3d> last_best_path_;
+  // Telemetry-only snapshot used to count committed A->B->A reversals. It is
+  // never consulted by candidate scoring or topology selection.
+  std::vector<Eigen::Vector3d> previous_committed_topology_;
+
+  enum class TCBSPendingDecision {
+    NONE,
+    INITIAL,
+    KEEP,
+    SWITCH,
+    FORCE_SWITCH
+  };
+
+  struct TCBSStatistics {
+    uint64_t planning_cycle_count = 0;
+    uint64_t topology_switch_count = 0;
+    uint64_t topology_keep_count = 0;
+    uint64_t topology_reversal_count = 0;
+    uint64_t invalid_keep_count = 0;
+    uint64_t challenger_accepted_count = 0;
+    uint64_t challenger_rejected_by_eta_count = 0;
+  };
+
+  TCBSStatistics tcbs_statistics_;
+  TCBSPendingDecision pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  uint64_t pending_path_id_ = 0;
   bool last_success_ = true;
   DynaVoro::MapChangeSet active_map_changes_;
   uint64_t last_processed_map_revision_ = 0;
@@ -357,6 +388,7 @@ public:
                       const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findDubinsShots(const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase);
+  void commitGuidePath(const vector<Eigen::Vector3d>& accepted_path);
   vector<vector<Eigen::Vector3d>> getPathContainer(const int& label = 0);
   vector<TopologicalPathCost> getPathCosts(const int& label = 0) const;
   void preprocess();

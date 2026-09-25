@@ -5,6 +5,8 @@
   <arg name="Diff_Model" value="false"/>
   <arg name="B_Spline_LocalPlanner" value = "false"/>
   <arg name="sim_pose" value="false"/>
+  <arg name="enable_tcbs" default="false"/>
+  <arg name="eta_switch" default="0.15"/>
 
   <!--用来校正gazebo的原点和本算法world坐标系的原点-->
   <arg name="offset_gazebo_world_x" value="20"/> 
@@ -84,6 +86,8 @@
     <!-- 2: use global waypoints below  -->
     <arg name="flight_type" value="1" />
     <arg name="B_Spline_LocalPlanner" value="$(arg B_Spline_LocalPlanner)"/>
+    <arg name="enable_tcbs" value="$(arg enable_tcbs)"/>
+    <arg name="eta_switch" value="$(arg eta_switch)"/>
   </include>
 
   <!-- trajectory server -->

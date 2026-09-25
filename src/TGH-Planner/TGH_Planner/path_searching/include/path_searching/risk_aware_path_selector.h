@@ -19,6 +19,15 @@ struct PathSelectionCandidate {
   double prs_score = 0.0;
 };
 
+// Lightweight TCBS evaluation data. It is intentionally not used by the
+// legacy selector until TCBS is explicitly enabled and implemented.
+struct TCBSScore {
+  double efficiency = 0.0;
+  double risk = 0.0;
+  double bottleneck = std::numeric_limits<double>::infinity();
+  bool feasible = false;
+};
+
 struct PathSelectionResult {
   bool success = false;
   std::size_t best_index = 0;
@@ -63,6 +72,8 @@ class RiskAwarePathSelector {
     double lambda_length = 1.0;
     double lambda_risk = 1.0;
     double lambda_prs = 1.0;
+    bool enable_tcbs = false;
+    double eta_switch = 0.15;
   };
 
   RiskAwarePathSelector() = default;
@@ -77,9 +88,15 @@ class RiskAwarePathSelector {
       const std::vector<PathSelectionCandidate>& candidates,
       double start_yaw) const;
 
+  TCBSScore evaluateTCBSScore(const std::vector<Eigen::Vector3d>& path,
+                              double length,
+                              double risk) const;
+
   const Parameters& getParameters() const { return params_; }
 
  private:
+  static double computeEfficiency(const std::vector<Eigen::Vector3d>& path,
+                                  double length);
   double computeAverageCorridorWidth(
       const std::vector<PathSelectionCandidate>& candidates) const;
   static double initialHeadingError(const std::vector<Eigen::Vector3d>& path,

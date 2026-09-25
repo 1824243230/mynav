@@ -40,6 +40,10 @@ void RiskAwarePathSelector::init(ros::NodeHandle& nh,
            params_.orientation_tie_threshold, params_.orientation_tie_threshold);
   nh.param("risk_aware_path_selector/sample_resolution",
            params_.sample_resolution, params_.sample_resolution);
+  nh.param("risk_aware_path_selector/enable_tcbs", params_.enable_tcbs,
+           params_.enable_tcbs);
+  nh.param("risk_aware_path_selector/eta_switch", params_.eta_switch,
+           params_.eta_switch);
   nh.param("path_reliability/enable", params_.reliability_enabled,
            params_.reliability_enabled);
   nh.param("path_reliability/lambda_length", params_.lambda_length,
@@ -56,6 +60,8 @@ void RiskAwarePathSelector::init(ros::NodeHandle& nh,
                   << ", high_risk_threshold=" << params_.high_risk_threshold
                   << ", open_space_width_threshold="
                   << params_.open_space_width_threshold
+                  << ", enable_tcbs=" << std::boolalpha << params_.enable_tcbs
+                  << ", eta_switch=" << params_.eta_switch
                   << ", reliability_enabled=" << std::boolalpha
                   << params_.reliability_enabled
                   << ", lambda_length=" << params_.lambda_length
@@ -154,6 +160,50 @@ PathSelectionResult RiskAwarePathSelector::selectBestPath(
   return result;
 }
 
+TCBSScore RiskAwarePathSelector::evaluateTCBSScore(
+    const std::vector<Eigen::Vector3d>& path,
+    double length,
+    double risk) const {
+  TCBSScore score;
+  score.efficiency = computeEfficiency(path, length);
+
+  // Reuse the existing path risk and normalize it with the fixed physical
+  // high-risk threshold. Candidate-set min/max normalization is intentionally
+  // not used because its scale changes between replanning cycles.
+  if (!std::isfinite(score.efficiency) || !std::isfinite(risk) || risk < 0.0 ||
+      !std::isfinite(params_.high_risk_threshold) ||
+      params_.high_risk_threshold <= kEpsilon) {
+    return score;
+  }
+  score.risk = std::max(0.0, std::min(1.0, risk / params_.high_risk_threshold));
+
+  // TCBS bottleneck score: the worse of efficiency and normalized risk.
+  score.bottleneck = std::max(score.efficiency, score.risk);
+  score.feasible = std::isfinite(score.bottleneck);
+  return score;
+}
+
+double RiskAwarePathSelector::computeEfficiency(
+    const std::vector<Eigen::Vector3d>& path,
+    double length) {
+  if (path.size() < 2 || !std::isfinite(length) || length <= kEpsilon) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const double direct_distance =
+      (path.back() - path.front()).head<2>().norm();
+  if (!std::isfinite(direct_distance)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  // Efficiency penalty: zero is direct, one is maximally inefficient.
+  const double efficiency = 1.0 - direct_distance / (length + kEpsilon);
+  if (!std::isfinite(efficiency)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::max(0.0, std::min(1.0, efficiency));
+}
+
 double RiskAwarePathSelector::computeAverageCorridorWidth(
     const std::vector<PathSelectionCandidate>& candidates) const {
   if (!risk_map_manager_ || !risk_map_manager_->isReady()) {
@@ -232,6 +282,10 @@ RiskAwarePathSelector::Parameters RiskAwarePathSelector::sanitizeParameters(
       sanitized.orientation_tie_threshold < 0.0) {
     sanitized.orientation_tie_threshold = 0.05;
   }
+  if (!std::isfinite(sanitized.eta_switch)) {
+    sanitized.eta_switch = 0.15;
+  }
+  sanitized.eta_switch = std::max(0.0, std::min(1.0, sanitized.eta_switch));
   const double valid_map_resolution =
       std::isfinite(map_resolution) ? std::max(map_resolution, kEpsilon) : 0.1;
   if (!std::isfinite(sanitized.sample_resolution) ||

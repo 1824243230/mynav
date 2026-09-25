@@ -665,6 +665,7 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   pp_.time_adjust_   = t_adjust;
 
   updateTrajInfo();
+  topo_prm_->commitGuidePath(plan_data_.topo_guide_path_);
 
   return true;
 }

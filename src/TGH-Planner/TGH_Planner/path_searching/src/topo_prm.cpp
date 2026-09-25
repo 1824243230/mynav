@@ -87,6 +87,12 @@ bool visLineStep_ = false;
 std::string file_path_;
 
 namespace fast_planner {
+namespace {
+
+constexpr double kTCBSScoreTieEpsilon = 1e-9;
+
+}  // namespace
+
 TopologyPRM::TopologyPRM(/* args */) {}
 
 TopologyPRM::~TopologyPRM() {}
@@ -1034,6 +1040,46 @@ void TopologyPRM::updatePathCost(TopoPath& path) {
   path.risk_edges = cost.edges;
 }
 
+bool TopologyPRM::isBetterTCBSCandidate(const TopoPath& candidate,
+                                        const TopoPath* best) const {
+  if (!candidate.tcbs_score.feasible) return false;
+  if (best == nullptr) return true;
+
+  const double candidate_score = candidate.tcbs_score.bottleneck;
+  const double best_score = best->tcbs_score.bottleneck;
+  if (candidate_score < best_score - kTCBSScoreTieEpsilon) return true;
+  if (std::abs(candidate_score - best_score) > kTCBSScoreTieEpsilon) return false;
+
+  // Stable secondary ordering for equal bottleneck scores: shorter path first,
+  // then the persistent path instance ID.
+  if (candidate.length < best->length - kTCBSScoreTieEpsilon) return true;
+  if (std::abs(candidate.length - best->length) > kTCBSScoreTieEpsilon) return false;
+  return candidate.path_id < best->path_id;
+}
+
+void TopologyPRM::findBestTCBSCandidates(const vector<TopoPath*>& candidates,
+                                         int& keep_index,
+                                         int& challenger_index) {
+  keep_index = -1;
+  challenger_index = -1;
+  const bool has_current_topology = !last_best_path_.empty();
+
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    TopoPath* candidate = candidates[index];
+    if (!candidate->tcbs_score.feasible) continue;
+
+    // A Keep candidate belongs to the currently selected topology H_t; every
+    // other feasible candidate is a Challenger.
+    const bool is_keep = has_current_topology &&
+        sameTopoPath(candidate->path, last_best_path_, 0.0, true);
+    int& best_index = is_keep ? keep_index : challenger_index;
+    const TopoPath* best = best_index >= 0 ? candidates[best_index] : nullptr;
+    if (isBetterTCBSCandidate(*candidate, best)) {
+      best_index = static_cast<int>(index);
+    }
+  }
+}
+
 void TopologyPRM::logPathCosts() const {
   const vector<TopologicalPathCost> costs = getPathCosts();
   for (size_t index = 0; index < costs.size(); ++index) {
@@ -1792,10 +1838,20 @@ vector<Eigen::Vector3d> TopologyPRM::findDubinsShots(const Eigen::Vector3d& star
 }
 
 
-// Select the best_path by maximizing risk-aware utility. Orientation remains
-// the tie breaker for candidates with near-equal utility.
+// Select the guide path with the legacy risk-aware utility, or with TCBS
+// Keep/Challenger separation when the opt-in switch is enabled.
 vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase) {
-  if(path_container_front_.empty() && path_container_back_.empty()) return {};
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  const bool tcbs_enabled = risk_aware_path_selector_ &&
+      risk_aware_path_selector_->getParameters().enable_tcbs;
+  ++tcbs_statistics_.planning_cycle_count;
+  if(path_container_front_.empty() && path_container_back_.empty()) {
+    ROS_DEBUG_STREAM("[TCBS] mode=" << (tcbs_enabled ? "TCBS" : "BASELINE")
+                     << " cycle=" << tcbs_statistics_.planning_cycle_count
+                     << " decision=FAIL reason=no_candidates");
+    return {};
+  }
 
   std::vector<TopoPath*> candidates;
   candidates.reserve(path_container_front_.size() + path_container_back_.size());
@@ -1809,6 +1865,18 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
   for (std::size_t index = 0; index < candidates.size(); ++index) {
     TopoPath* candidate = candidates[index];
     updatePathCost(*candidate);
+    if (tcbs_enabled) {
+      candidate->tcbs_score = risk_aware_path_selector_->evaluateTCBSScore(
+          candidate->path, candidate->length, candidate->risk);
+      candidate->tcbs_score.feasible = candidate->tcbs_score.feasible &&
+          candidate->safty && candidate->state == TopoPath::VALID;
+      ROS_DEBUG_STREAM("[TCBS] candidate path_id=" << candidate->path_id
+                       << " E=" << candidate->tcbs_score.efficiency
+                       << " R=" << candidate->tcbs_score.risk
+                       << " B=" << candidate->tcbs_score.bottleneck
+                       << " feasible=" << std::boolalpha
+                       << candidate->tcbs_score.feasible);
+    }
     PathSelectionCandidate selection_candidate;
     selection_candidate.path = candidate->path;
     selection_candidate.length = candidate->length;
@@ -1835,29 +1903,230 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
     selection.best_path = candidates.front()->path;
   }
 
+  if (tcbs_enabled) {
+    int keep_index = -1;
+    int challenger_index = -1;
+    findBestTCBSCandidates(candidates, keep_index, challenger_index);
+
+    int tcbs_best_index = -1;
+    const bool has_current_topology = !last_best_path_.empty();
+    const double eta_switch =
+        risk_aware_path_selector_->getParameters().eta_switch;
+    const double keep_score = keep_index >= 0
+        ? candidates[keep_index]->tcbs_score.bottleneck
+        : std::numeric_limits<double>::infinity();
+    const double challenger_score = challenger_index >= 0
+        ? candidates[challenger_index]->tcbs_score.bottleneck
+        : std::numeric_limits<double>::infinity();
+    const char* decision = "FAIL";
+    const char* reason = "no_feasible_candidate";
+
+    if (keep_index < 0) {
+      // No feasible Keep (including the first planning cycle): use the best
+      // Challenger immediately, without applying switch hysteresis.
+      tcbs_best_index = challenger_index;
+      if (challenger_index >= 0 && has_current_topology) {
+        ++tcbs_statistics_.invalid_keep_count;
+        pending_tcbs_decision_ = TCBSPendingDecision::FORCE_SWITCH;
+        decision = "FORCE_SWITCH";
+        reason = "keep_invalid";
+      } else if (challenger_index >= 0) {
+        pending_tcbs_decision_ = TCBSPendingDecision::INITIAL;
+        decision = "SWITCH";
+        reason = "no_current_topology";
+      }
+    } else if (challenger_index < 0) {
+      tcbs_best_index = keep_index;
+      pending_tcbs_decision_ = TCBSPendingDecision::KEEP;
+      decision = "KEEP";
+      reason = "no_challenger";
+    } else {
+      const double switch_threshold =
+          (1.0 - eta_switch) * keep_score;
+
+      // A topology switch is allowed only when the Challenger is strictly
+      // better than the eta_switch threshold.
+      if (challenger_score < switch_threshold) {
+        tcbs_best_index = challenger_index;
+        pending_tcbs_decision_ = TCBSPendingDecision::SWITCH;
+        decision = "SWITCH";
+        reason = "margin";
+      } else {
+        tcbs_best_index = keep_index;
+        pending_tcbs_decision_ = TCBSPendingDecision::KEEP;
+        ++tcbs_statistics_.challenger_rejected_by_eta_count;
+        decision = "KEEP";
+        reason = "margin";
+      }
+    }
+
+    ROS_DEBUG_STREAM("[TCBS] cycle="
+                     << tcbs_statistics_.planning_cycle_count
+                     << " keep_B=" << keep_score
+                     << " challenger_B=" << challenger_score
+                     << " eta=" << eta_switch
+                     << " decision=" << decision
+                     << " reason=" << reason);
+
+    if (tcbs_best_index < 0) {
+      ROS_WARN_THROTTLE(1.0, "TCBS found no feasible Keep or Challenger candidate.");
+      return {};
+    }
+
+    selection.best_index = static_cast<std::size_t>(tcbs_best_index);
+    selection.best_path = candidates[selection.best_index]->path;
+    pending_path_id_ = candidates[selection.best_index]->path_id;
+    ROS_DEBUG_STREAM("[TCBS] keep_index=" << keep_index
+                     << " challenger_index=" << challenger_index
+                     << " proposed_path_id="
+                     << candidates[selection.best_index]->path_id);
+  }
+
   const TopoPath& best_path = *candidates[selection.best_index];
-  last_best_path_ = discretizePath(selection.best_path);
+  vector<Eigen::Vector3d> guide_path = discretizePath(selection.best_path);
+  if (!tcbs_enabled) {
+    // Observe the legacy result without changing its immediate commit timing.
+    const bool had_current_topology = !last_best_path_.empty();
+    const bool topology_changed = had_current_topology &&
+        !sameTopoPath(guide_path, last_best_path_, 0.0, true);
+    const bool topology_reversed = topology_changed &&
+        !previous_committed_topology_.empty() &&
+        sameTopoPath(guide_path, previous_committed_topology_, 0.0, true);
+    if (had_current_topology) {
+      if (topology_changed) {
+        ++tcbs_statistics_.topology_switch_count;
+      } else {
+        ++tcbs_statistics_.topology_keep_count;
+      }
+    }
+    if (topology_reversed) {
+      ++tcbs_statistics_.topology_reversal_count;
+    }
+    if (topology_changed) {
+      previous_committed_topology_ = last_best_path_;
+    }
+    last_best_path_ = guide_path;
+    ROS_DEBUG_STREAM("[TCBS] mode=BASELINE stats planning_cycles="
+                     << tcbs_statistics_.planning_cycle_count
+                     << " topology_switches="
+                     << tcbs_statistics_.topology_switch_count
+                     << " topology_keeps="
+                     << tcbs_statistics_.topology_keep_count
+                     << " topology_reversals="
+                     << tcbs_statistics_.topology_reversal_count);
+  }
   path_pts_sprase = selection.best_path;
   publishGuidePath(selection.best_path);
 
-  ROS_INFO_STREAM("[RiskPathSelector] best_path {length: " << best_path.length
-                  << ", risk: " << best_path.risk
-                  << ", cost: " << selection.cost
-                  << ", normalized_length: " << selection.normalized_length
-                  << ", normalized_risk: " << selection.normalized_risk
-                  << ", prs_score: " << selection.prs_score
-                  << ", reliability_enabled: " << std::boolalpha
-                  << selection.reliability_enabled
-                  << ", lambda_length: " << selection.lambda_length
-                  << ", lambda_risk: " << selection.lambda_risk
-                  << ", lambda_prs: " << selection.lambda_prs
-                  << ", w1: " << selection.w1
-                  << ", w2: " << selection.w2
-                  << ", average_risk: " << selection.average_risk
-                  << ", average_corridor_width: "
-                  << selection.average_corridor_width
-                  << ", orientation_error: " << selection.orientation_error << "}");
-  return last_best_path_; // 需要返回的是稠密的路径点。
+  if (tcbs_enabled) {
+    ROS_DEBUG_STREAM("[TCBS] proposed path_id=" << best_path.path_id
+                     << " E=" << best_path.tcbs_score.efficiency
+                     << " R=" << best_path.tcbs_score.risk
+                     << " B=" << best_path.tcbs_score.bottleneck);
+  } else {
+    ROS_INFO_STREAM("[RiskPathSelector] best_path {length: " << best_path.length
+                    << ", risk: " << best_path.risk
+                    << ", cost: " << selection.cost
+                    << ", normalized_length: " << selection.normalized_length
+                    << ", normalized_risk: " << selection.normalized_risk
+                    << ", prs_score: " << selection.prs_score
+                    << ", reliability_enabled: " << std::boolalpha
+                    << selection.reliability_enabled
+                    << ", lambda_length: " << selection.lambda_length
+                    << ", lambda_risk: " << selection.lambda_risk
+                    << ", lambda_prs: " << selection.lambda_prs
+                    << ", w1: " << selection.w1
+                    << ", w2: " << selection.w2
+                    << ", average_risk: " << selection.average_risk
+                    << ", average_corridor_width: "
+                    << selection.average_corridor_width
+                    << ", orientation_error: " << selection.orientation_error << "}");
+  }
+  return guide_path; // 需要返回的是稠密的路径点。
+}
+
+void TopologyPRM::commitGuidePath(
+    const vector<Eigen::Vector3d>& accepted_path) {
+  if (!risk_aware_path_selector_ ||
+      !risk_aware_path_selector_->getParameters().enable_tcbs ||
+      pending_path_id_ == 0 || accepted_path.empty()) {
+    return;
+  }
+
+  // Candidate comparison only creates a proposal. Commit current topology
+  // after the downstream planner has accepted its resulting trajectory.
+  bool selected_path_found = false;
+  auto contains_pending_path = [&](const vector<TopoPath>& container) {
+    return std::any_of(container.begin(), container.end(),
+                       [&](const TopoPath& path) {
+                         return path.path_id == pending_path_id_;
+                       });
+  };
+  selected_path_found = contains_pending_path(path_container_front_) ||
+                        contains_pending_path(path_container_back_);
+  if (!selected_path_found) {
+    ROS_WARN_THROTTLE(
+        1.0, "TCBS accepted path is no longer in the topology container; "
+             "keeping the previously committed topology.");
+    pending_path_id_ = 0;
+    pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+    return;
+  }
+
+  const bool had_current_topology = !last_best_path_.empty();
+  const bool topology_changed = had_current_topology &&
+      !sameTopoPath(accepted_path, last_best_path_, 0.0, true);
+  const bool topology_reversed = topology_changed &&
+      !previous_committed_topology_.empty() &&
+      sameTopoPath(accepted_path, previous_committed_topology_, 0.0, true);
+  const bool challenger_accepted =
+      pending_tcbs_decision_ == TCBSPendingDecision::INITIAL ||
+      pending_tcbs_decision_ == TCBSPendingDecision::SWITCH ||
+      pending_tcbs_decision_ == TCBSPendingDecision::FORCE_SWITCH;
+
+  if (had_current_topology) {
+    if (topology_changed) {
+      ++tcbs_statistics_.topology_switch_count;
+    } else {
+      ++tcbs_statistics_.topology_keep_count;
+    }
+  }
+  if (topology_reversed) {
+    ++tcbs_statistics_.topology_reversal_count;
+  }
+  if (challenger_accepted) {
+    ++tcbs_statistics_.challenger_accepted_count;
+  }
+  if (topology_changed) {
+    previous_committed_topology_ = last_best_path_;
+  }
+
+  last_best_path_ = accepted_path;
+  auto commit_selected_flag = [&](vector<TopoPath>& container) {
+    for (TopoPath& path : container) {
+      path.selected = path.path_id == pending_path_id_;
+    }
+  };
+  commit_selected_flag(path_container_front_);
+  commit_selected_flag(path_container_back_);
+
+  ROS_DEBUG_STREAM("[TCBS] committed path_id=" << pending_path_id_);
+  ROS_DEBUG_STREAM("[TCBS] stats planning_cycles="
+                   << tcbs_statistics_.planning_cycle_count
+                   << " topology_switches="
+                   << tcbs_statistics_.topology_switch_count
+                   << " topology_keeps="
+                   << tcbs_statistics_.topology_keep_count
+                   << " topology_reversals="
+                   << tcbs_statistics_.topology_reversal_count
+                   << " invalid_keeps="
+                   << tcbs_statistics_.invalid_keep_count
+                   << " challengers_accepted="
+                   << tcbs_statistics_.challenger_accepted_count
+                   << " challengers_rejected_by_eta="
+                   << tcbs_statistics_.challenger_rejected_by_eta_count);
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
 }
 
 void TopologyPRM::publishGuidePath(const std::vector<Eigen::Vector3d>& path_nodes)
@@ -2432,6 +2701,9 @@ void TopologyPRM::setStartChange(vector<Eigen::Vector3d>& start_change)
 void TopologyPRM::resetPathContainer()
 {
   last_best_path_.resize(0);
+  previous_committed_topology_.clear();
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
   path_container_back_.resize(0);
   path_container_front_.resize(0);
   ROS_WARN("Reset Path Container because goal or start changed too much!");
