@@ -286,6 +286,10 @@ RiskAwarePathSelector::Parameters RiskAwarePathSelector::sanitizeParameters(
     sanitized.eta_switch = 0.15;
   }
   sanitized.eta_switch = std::max(0.0, std::min(1.0, sanitized.eta_switch));
+  if (!std::isfinite(sanitized.high_risk_threshold) ||
+      sanitized.high_risk_threshold <= kEpsilon) {
+    sanitized.high_risk_threshold = Parameters().high_risk_threshold;
+  }
   const double valid_map_resolution =
       std::isfinite(map_resolution) ? std::max(map_resolution, kEpsilon) : 0.1;
   if (!std::isfinite(sanitized.sample_resolution) ||

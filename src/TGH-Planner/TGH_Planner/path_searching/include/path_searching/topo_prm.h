@@ -389,6 +389,8 @@ public:
   vector<Eigen::Vector3d> findDubinsShots(const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase);
   void commitGuidePath(const vector<Eigen::Vector3d>& accepted_path);
+  bool tryCommitGuidePath(const vector<Eigen::Vector3d>& accepted_path);
+  bool rejectPendingGuidePath();
   vector<vector<Eigen::Vector3d>> getPathContainer(const int& label = 0);
   vector<TopologicalPathCost> getPathCosts(const int& label = 0) const;
   void preprocess();

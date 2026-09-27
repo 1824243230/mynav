@@ -27,6 +27,19 @@
 #include <ros/ros.h>
 
 namespace fast_planner {
+namespace {
+double refinedAcceleration(const Eigen::VectorXd& velocity,
+                           const Eigen::VectorXd& acceleration) {
+  constexpr double kSpeedEpsilon = 1e-8;
+  // At rest the tangential direction is undefined. Use the full acceleration
+  // instead of dividing by zero and silently passing a NaN comparison.
+  if (velocity.norm() <= kSpeedEpsilon) return acceleration.norm();
+  const double tangential = acceleration.dot(velocity) / velocity.norm();
+  const double normal_squared = std::max(0.0, acceleration.squaredNorm() -
+                                                tangential * tangential);
+  return std::sqrt(tangential * tangential + 0.12 * normal_squared);
+}
+}  // namespace
 
 NonUniformBspline::NonUniformBspline(const Eigen::MatrixXd& points, const int& order,
                                      const double& interval) {
@@ -224,6 +237,9 @@ void NonUniformBspline::setPhysicalLimits(const double& vel, const double& acc) 
 }
 
 bool NonUniformBspline::checkFeasibility(bool show) {
+  if (!control_points_.allFinite() || !u_.allFinite() ||
+      !std::isfinite(limit_vel_) || !std::isfinite(limit_acc_) ||
+      limit_vel_ <= 0.0 || limit_acc_ <= 0.0) return false;
   bool fea = true;
   // SETY << "[Bspline]: total points size: " << control_points_.rows() << endl;
 
@@ -234,6 +250,8 @@ bool NonUniformBspline::checkFeasibility(bool show) {
   double max_vel = -1.0;
   for (int i = 0; i < P.rows() - 1; ++i) {
     Eigen::VectorXd vel = p_ * (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1));
+
+    if (!vel.allFinite()) return false;
 
     if (vel.head(2).norm() > limit_vel_ + 1e-4 ) { 
 
@@ -254,12 +272,11 @@ bool NonUniformBspline::checkFeasibility(bool show) {
         ((P.row(i + 2) - P.row(i + 1)) / (u_(i + p_ + 2) - u_(i + 2)) -
          (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
         (u_(i + p_ + 1) - u_(i + 2));
-    double acc_tang = acc.dot(vel) / vel.norm();
-    double acc_norm = std::sqrt(acc.squaredNorm() - acc_tang * acc_tang);
-    double acc_refine = std::sqrt(acc_tang * acc_tang + 0.12 * acc_norm * acc_norm);
+    if (!vel.allFinite() || !acc.allFinite()) return false;
+    const double acc_refine = refinedAcceleration(vel, acc);
     if (acc_refine > limit_acc_ + 1e-4 ) {
 
-      if (show) cout << "[Check]: Infeasible acc " << i << " :" << acc_tang << ", " << acc_refine << endl;
+      if (show) cout << "[Check]: Infeasible acc " << i << " :" << acc_refine << endl;
       fea = false;
 
       // for (int j = 0; j < dimension; ++j) {
@@ -303,6 +320,9 @@ double NonUniformBspline::checkRatio() {
 }
 
 bool NonUniformBspline::reallocateTime(bool show) {
+  if (!control_points_.allFinite() || !u_.allFinite() ||
+      !std::isfinite(limit_vel_) || !std::isfinite(limit_acc_) ||
+      limit_vel_ <= 0.0 || limit_acc_ <= 0.0) return false;
   // SETY << "[Bspline]: total points size: " << control_points_.rows() << endl;
   // cout << "origin knots:\n" << u_.transpose() << endl;
   bool fea = true;
@@ -357,9 +377,8 @@ bool NonUniformBspline::reallocateTime(bool show) {
         ((P.row(i + 2) - P.row(i + 1)) / (u_(i + p_ + 2) - u_(i + 2)) -
          (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
         (u_(i + p_ + 1) - u_(i + 2));
-    double acc_tang = acc.dot(vel) / vel.norm();
-    double acc_norm = std::sqrt(acc.squaredNorm() - acc_tang * acc_tang);
-    double acc_refine = std::sqrt(acc_tang * acc_tang + 0.12 * acc_norm * acc_norm);
+    if (!vel.allFinite() || !acc.allFinite()) return false;
+    const double acc_refine = refinedAcceleration(vel, acc);
     if (acc_refine > limit_acc_ + 1e-4 ) {
 
       fea = false;

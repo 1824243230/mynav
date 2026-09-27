@@ -320,6 +320,16 @@ void FastPlannerManager::TopoPathReplan(Eigen::Vector3d start_pt, Eigen::Vector3
     plan_data_.waypoint_ = topo_prm_->generateWayPoint(plan_data_.topo_guide_path_, start_pt);
 }
 
+bool FastPlannerManager::selectNextTopoGuidePath(
+    const Eigen::Vector3d& start_pt, const Eigen::Vector3d& start_yaw) {
+  Eigen::Vector3d start_state = start_pt;
+  start_state.z() = Mod2Pi(start_yaw.x());
+  vector<Eigen::Vector3d> sparse_path;
+  plan_data_.topo_guide_path_ =
+      topo_prm_->findGuidePath(start_state, sparse_path);
+  return !plan_data_.topo_guide_path_.empty();
+}
+
 
 bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                            Eigen::Vector3d start_acc, Eigen::Vector3d end_pt,
@@ -411,6 +421,10 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
     plan_data_.search_tree = kino_path_finder_->getSearchTree();
   double delta_t_geo = 0.1;
   plan_data_.kino_path_ = kino_path_finder_->getKinoTraj(delta_t_geo);
+  if (plan_data_.kino_path_.size() < 2) {
+    ROS_WARN_THROTTLE(1.0, "Reject kinodynamic search result with fewer than two path points.");
+    return false;
+  }
   for (size_t i = 1; i < plan_data_.kino_path_.size(); ++i) {
       double dist = (plan_data_.kino_path_[i] - plan_data_.kino_path_[i - 1]).norm();
       if (dist >  (pp_.max_vel_ * delta_t_geo * 5)) {
@@ -614,12 +628,22 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   pos.setPhysicalLimits(1.05 * pp_.max_vel_, 1.1 * pp_.max_acc_); // 这里要加上一个尺度因子
   bool feasible = pos.checkFeasibility(false);
 
+  // Each local knot adjustment is capped at 1.1. Three passes can be
+  // insufficient, especially for a trajectory starting from rest.
+  constexpr int kMaxTimeReallocationIterations = 30;
   int iter_num = 0;
-  while (!feasible && ros::ok()) {
-
-    feasible = pos.reallocateTime();
-
-    if (++iter_num >= 3) break;
+  while (!feasible && ros::ok() && iter_num < kMaxTimeReallocationIterations) {
+    pos.reallocateTime();
+    // reallocateTime reports violations encountered BEFORE modifying knots.
+    // Acceptance must check the actual, updated trajectory.
+    feasible = pos.checkFeasibility(false);
+    ++iter_num;
+  }
+  // A trajectory that still violates velocity or acceleration limits is not
+  // a valid CandidatePlan and must not be published or committed to TCBS.
+  if (!feasible) {
+    ROS_WARN_THROTTLE(1.0, "B-spline remains dynamically infeasible after time reallocation.");
+    return false;
   }
   if(save_info_) { saveBsplineInfo(pos, "reall", false); }
   // pos.checkFeasibility(true);
@@ -654,6 +678,60 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   double t_total_e = (ros::Time::now() - local_data_.start_time_).toSec();
   // save planned results
 
+  // Perform a final hard collision/non-finite check on the exact B-spline
+  // that would be published. Optimizer costs alone are not an acceptance test.
+  constexpr double kTrajectoryValidationStep = 0.02;
+  constexpr double kTopologySampleStep = 0.1;
+  constexpr double kMinimumObstacleClearance = 0.15;
+  constexpr double kDuplicatePointDistanceSquared = 1e-12;
+  const double trajectory_duration = pos.getTimeSum();
+  if (!std::isfinite(trajectory_duration) || trajectory_duration <= 0.0) {
+    ROS_WARN_THROTTLE(1.0, "Reject final B-spline: invalid duration.");
+    return false;
+  }
+  vector<Eigen::Vector3d> accepted_trajectory;
+  accepted_trajectory.reserve(
+      static_cast<size_t>(std::ceil(trajectory_duration / kTopologySampleStep)) + 2);
+  double next_topology_sample = 0.0;
+  for (double t = 0.0; t < trajectory_duration;
+       t += kTrajectoryValidationStep) {
+    Eigen::Vector3d point = pos.evaluateDeBoorT(t);
+    const double query_time = pp_.dynamic_ ? t : -1.0;
+    const double clearance = point.allFinite()
+        ? edt_environment_->evaluateCoarseEDT(point, query_time, only2D_)
+        : std::numeric_limits<double>::quiet_NaN();
+    if (!std::isfinite(clearance) ||
+        clearance < kMinimumObstacleClearance) {
+      ROS_WARN_THROTTLE(1.0, "Reject final B-spline: non-finite or collision point detected.");
+      return false;
+    }
+    if (t + 1e-9 >= next_topology_sample) {
+      accepted_trajectory.push_back(point);
+      next_topology_sample += kTopologySampleStep;
+    }
+  }
+  Eigen::Vector3d final_point = pos.evaluateDeBoorT(trajectory_duration);
+  const double final_query_time = pp_.dynamic_ ? trajectory_duration : -1.0;
+  const double final_clearance = final_point.allFinite()
+      ? edt_environment_->evaluateCoarseEDT(final_point, final_query_time, only2D_)
+      : std::numeric_limits<double>::quiet_NaN();
+  if (!std::isfinite(final_clearance) ||
+      final_clearance < kMinimumObstacleClearance) {
+    ROS_WARN_THROTTLE(1.0, "Reject final B-spline endpoint: non-finite or in collision.");
+    return false;
+  }
+  if (accepted_trajectory.empty() ||
+      (accepted_trajectory.back() - final_point).squaredNorm() >
+          kDuplicatePointDistanceSquared) {
+    accepted_trajectory.push_back(final_point);
+  }
+
+  // Commit is atomic with downstream acceptance and verifies that the final
+  // optimized trajectory remains in the TCBS-proposed topology.
+  if (!topo_prm_->tryCommitGuidePath(accepted_trajectory)) {
+    return false;
+  }
+
   local_data_.position_traj_ = pos;
 
   double t_total = t_search + t_opt + t_adjust;
@@ -665,8 +743,6 @@ bool FastPlannerManager::kinodynamicReplan(Eigen::Vector3d start_pt, Eigen::Vect
   pp_.time_adjust_   = t_adjust;
 
   updateTrajInfo();
-  topo_prm_->commitGuidePath(plan_data_.topo_guide_path_);
-
   return true;
 }
 

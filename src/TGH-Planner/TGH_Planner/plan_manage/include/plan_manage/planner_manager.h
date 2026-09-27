@@ -83,6 +83,16 @@ public:
   {
     topo_prm_->resetPathContainer();
   }
+  bool commitTopoGuidePath(const vector<Eigen::Vector3d>& accepted_path)
+  {
+    return topo_prm_ && topo_prm_->tryCommitGuidePath(accepted_path);
+  }
+  bool rejectPendingTopoPath()
+  {
+    return topo_prm_ && topo_prm_->rejectPendingGuidePath();
+  }
+  bool selectNextTopoGuidePath(const Eigen::Vector3d& start_pt,
+                               const Eigen::Vector3d& start_yaw);
   void topoUpdate(std::vector<Eigen::Vector3d>& start_change);
   
 private:

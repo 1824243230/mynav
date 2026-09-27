@@ -1,5 +1,6 @@
 
 #include "dvr/voronoi_layer.h"
+#include <filesystem>
 // #define VERBOSE
 // #define SavePathData
 bool debug_flag_ = false;
@@ -65,15 +66,18 @@ VoronoiLayer::VoronoiLayer(ros::NodeHandle& nh)
   voronoi_update_timer_ = nh.createTimer(ros::Duration(2), &VoronoiLayer::voronoiUpdateTimerCallback, this);
 
   #ifdef SavePathData
-  std::string save_file;
-  std::string default_path = "ChangeToYourPath/";
-  nh.param("FilePath", save_file, default_path);
-  save_file += "Utils/global_plan_record/Scene_6/plan_data.txt";
-  save_file = "/home/bhrqhb/catkin_TGH_new/src/TGH_Planner/Utils/global_plan_record/Scene6/plan_data.txt";
-  path_data_.save_file_stream.open(save_file.c_str(), std::ios::out);
-  if(!path_data_.save_file_stream.is_open())
-  {
-    ROS_ERROR_STREAM("Unable to open file to save traj info! at: " << save_file);
+  std::string save_root;
+  nh.param("FilePath", save_root, std::string());
+  if (!save_root.empty()) {
+    const std::filesystem::path save_file = std::filesystem::path(save_root) /
+        "Utils/global_plan_record/Scene_6/plan_data.txt";
+    std::error_code error;
+    std::filesystem::create_directories(save_file.parent_path(), error);
+    if (!error) path_data_.save_file_stream.open(save_file, std::ios::out);
+    if (!path_data_.save_file_stream.is_open()) {
+      ROS_WARN_STREAM("Unable to open optional path data file at " << save_file
+                      << (error ? ": " + error.message() : ""));
+    }
   }
   #endif
 }

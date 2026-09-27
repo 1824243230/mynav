@@ -1985,35 +1985,9 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
   const TopoPath& best_path = *candidates[selection.best_index];
   vector<Eigen::Vector3d> guide_path = discretizePath(selection.best_path);
   if (!tcbs_enabled) {
-    // Observe the legacy result without changing its immediate commit timing.
-    const bool had_current_topology = !last_best_path_.empty();
-    const bool topology_changed = had_current_topology &&
-        !sameTopoPath(guide_path, last_best_path_, 0.0, true);
-    const bool topology_reversed = topology_changed &&
-        !previous_committed_topology_.empty() &&
-        sameTopoPath(guide_path, previous_committed_topology_, 0.0, true);
-    if (had_current_topology) {
-      if (topology_changed) {
-        ++tcbs_statistics_.topology_switch_count;
-      } else {
-        ++tcbs_statistics_.topology_keep_count;
-      }
-    }
-    if (topology_reversed) {
-      ++tcbs_statistics_.topology_reversal_count;
-    }
-    if (topology_changed) {
-      previous_committed_topology_ = last_best_path_;
-    }
-    last_best_path_ = guide_path;
-    ROS_DEBUG_STREAM("[TCBS] mode=BASELINE stats planning_cycles="
-                     << tcbs_statistics_.planning_cycle_count
-                     << " topology_switches="
-                     << tcbs_statistics_.topology_switch_count
-                     << " topology_keeps="
-                     << tcbs_statistics_.topology_keep_count
-                     << " topology_reversals="
-                     << tcbs_statistics_.topology_reversal_count);
+    // Legacy selection is unchanged; record its proposal so baseline and
+    // TCBS topology statistics both count accepted plans at commit time.
+    pending_path_id_ = best_path.path_id;
   }
   path_pts_sprase = selection.best_path;
   publishGuidePath(selection.best_path);
@@ -2047,38 +2021,114 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
 
 void TopologyPRM::commitGuidePath(
     const vector<Eigen::Vector3d>& accepted_path) {
-  if (!risk_aware_path_selector_ ||
-      !risk_aware_path_selector_->getParameters().enable_tcbs ||
-      pending_path_id_ == 0 || accepted_path.empty()) {
-    return;
+  (void)tryCommitGuidePath(accepted_path);
+}
+
+bool TopologyPRM::tryCommitGuidePath(
+    const vector<Eigen::Vector3d>& accepted_path) {
+  const bool tcbs_enabled = risk_aware_path_selector_ &&
+      risk_aware_path_selector_->getParameters().enable_tcbs;
+  if (!tcbs_enabled && pending_path_id_ == 0) return true;
+  if (pending_path_id_ == 0 || accepted_path.empty()) {
+    return false;
   }
 
   // Candidate comparison only creates a proposal. Commit current topology
   // after the downstream planner has accepted its resulting trajectory.
-  bool selected_path_found = false;
-  auto contains_pending_path = [&](const vector<TopoPath>& container) {
-    return std::any_of(container.begin(), container.end(),
-                       [&](const TopoPath& path) {
-                         return path.path_id == pending_path_id_;
-                       });
+  const TopoPath* selected_path = nullptr;
+  auto find_pending_path = [&](const vector<TopoPath>& container) {
+    auto iter = std::find_if(container.begin(), container.end(),
+                             [&](const TopoPath& path) {
+                               return path.path_id == pending_path_id_;
+                             });
+    return iter == container.end() ? nullptr : &(*iter);
   };
-  selected_path_found = contains_pending_path(path_container_front_) ||
-                        contains_pending_path(path_container_back_);
-  if (!selected_path_found) {
+  selected_path = find_pending_path(path_container_front_);
+  if (!selected_path) selected_path = find_pending_path(path_container_back_);
+  if (!selected_path) {
     ROS_WARN_THROTTLE(
         1.0, "TCBS accepted path is no longer in the topology container; "
              "keeping the previously committed topology.");
     pending_path_id_ = 0;
     pending_tcbs_decision_ = TCBSPendingDecision::NONE;
-    return;
+    return !tcbs_enabled;
+  }
+
+  const auto& guide = selected_path->path;
+  if (!tcbs_enabled) {
+    const bool had_current_topology = !last_best_path_.empty();
+    const bool topology_changed = had_current_topology &&
+        !sameTopoPath(guide, last_best_path_, 0.0, true);
+    const bool topology_reversed = topology_changed &&
+        !previous_committed_topology_.empty() &&
+        sameTopoPath(guide, previous_committed_topology_, 0.0, true);
+    if (had_current_topology) {
+      if (topology_changed) {
+        ++tcbs_statistics_.topology_switch_count;
+        previous_committed_topology_ = last_best_path_;
+      } else {
+        ++tcbs_statistics_.topology_keep_count;
+      }
+    }
+    if (topology_reversed) ++tcbs_statistics_.topology_reversal_count;
+    last_best_path_ = guide;
+    pending_path_id_ = 0;
+    ROS_DEBUG_STREAM("[TCBS] mode=BASELINE accepted_stats planning_cycles="
+                     << tcbs_statistics_.planning_cycle_count
+                     << " topology_switches="
+                     << tcbs_statistics_.topology_switch_count
+                     << " topology_keeps="
+                     << tcbs_statistics_.topology_keep_count
+                     << " topology_reversals="
+                     << tcbs_statistics_.topology_reversal_count);
+    return true;
+  }
+
+  // Hybrid A* may return a local trajectory before reaching the goal. Compare
+  // it with the corresponding prefix of the proposed topology, rather than
+  // stretching a short local trajectory against the entire guide path.
+  vector<Eigen::Vector3d> guide_prefix;
+  if (accepted_path.size() < 2 || guide.size() < 2) return false;
+  const Eigen::Vector2d endpoint = accepted_path.back().head<2>();
+  double nearest_distance_sq = std::numeric_limits<double>::infinity();
+  size_t nearest_segment = 0;
+  Eigen::Vector3d projected_point = guide.front();
+  for (size_t i = 0; i + 1 < guide.size(); ++i) {
+    const Eigen::Vector2d segment =
+        (guide[i + 1] - guide[i]).head<2>();
+    const double length_sq = segment.squaredNorm();
+    const double fraction = length_sq > 0.0
+        ? std::max(0.0, std::min(1.0,
+            (endpoint - guide[i].head<2>()).dot(segment) / length_sq))
+        : 0.0;
+    const Eigen::Vector3d projection =
+        guide[i] + fraction * (guide[i + 1] - guide[i]);
+    const double distance_sq =
+        (endpoint - projection.head<2>()).squaredNorm();
+    if (distance_sq < nearest_distance_sq) {
+      nearest_distance_sq = distance_sq;
+      nearest_segment = i;
+      projected_point = projection;
+    }
+  }
+  guide_prefix.assign(guide.begin(), guide.begin() + nearest_segment + 1);
+  guide_prefix.push_back(projected_point);
+
+  // The guide only biases Hybrid A*. Commit its topology only after the
+  // accepted trajectory has passed the existing homotopy comparison.
+  if (!sameTopoPath(accepted_path, guide_prefix, 0.0, true)) {
+    ROS_WARN_THROTTLE(
+        1.0, "TCBS final trajectory differs from the proposed topology; "
+             "rejecting the pending guide path.");
+    return false;
   }
 
   const bool had_current_topology = !last_best_path_.empty();
   const bool topology_changed = had_current_topology &&
-      !sameTopoPath(accepted_path, last_best_path_, 0.0, true);
+      !sameTopoPath(guide, last_best_path_, 0.0, true);
   const bool topology_reversed = topology_changed &&
       !previous_committed_topology_.empty() &&
-      sameTopoPath(accepted_path, previous_committed_topology_, 0.0, true);
+      sameTopoPath(guide, previous_committed_topology_, 0.0, true);
   const bool challenger_accepted =
       pending_tcbs_decision_ == TCBSPendingDecision::INITIAL ||
       pending_tcbs_decision_ == TCBSPendingDecision::SWITCH ||
@@ -2101,7 +2151,7 @@ void TopologyPRM::commitGuidePath(
     previous_committed_topology_ = last_best_path_;
   }
 
-  last_best_path_ = accepted_path;
+  last_best_path_ = guide;
   auto commit_selected_flag = [&](vector<TopoPath>& container) {
     for (TopoPath& path : container) {
       path.selected = path.path_id == pending_path_id_;
@@ -2127,6 +2177,36 @@ void TopologyPRM::commitGuidePath(
                    << tcbs_statistics_.challenger_rejected_by_eta_count);
   pending_path_id_ = 0;
   pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  return true;
+}
+
+bool TopologyPRM::rejectPendingGuidePath() {
+  if (!risk_aware_path_selector_ ||
+      !risk_aware_path_selector_->getParameters().enable_tcbs ||
+      pending_path_id_ == 0) {
+    return false;
+  }
+
+  auto reject_pending = [&](vector<TopoPath>& container) {
+    for (TopoPath& path : container) {
+      if (path.path_id != pending_path_id_) continue;
+      path.safty = false;
+      path.state = TopoPath::INVALID;
+      path.tcbs_score.feasible = false;
+      path.selected = false;
+      return true;
+    }
+    return false;
+  };
+  const bool rejected = reject_pending(path_container_front_) ||
+                        reject_pending(path_container_back_);
+  if (rejected) {
+    ROS_DEBUG_STREAM("[TCBS] rejected downstream-infeasible path_id="
+                     << pending_path_id_);
+  }
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  return rejected;
 }
 
 void TopologyPRM::publishGuidePath(const std::vector<Eigen::Vector3d>& path_nodes)
