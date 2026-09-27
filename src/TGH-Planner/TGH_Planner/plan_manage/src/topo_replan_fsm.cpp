@@ -25,13 +25,16 @@
 
 
 #include <plan_manage/topo_replan_fsm.h>
+#include <stdexcept>
 
 namespace fast_planner {
 
 void TopoReplanFSM::init(ros::NodeHandle& nh) {
   current_wp_  = 0;
   exec_state_  = FSM_EXEC_STATE::INIT;
+  trigger_     = false;
   have_target_ = false;
+  have_odom_   = false;
   collide_     = false;
 
   /*  fsm param  */
@@ -39,7 +42,19 @@ void TopoReplanFSM::init(ros::NodeHandle& nh) {
   nh.param("fsm/thresh_replan", replan_time_threshold_, -1.0);
   nh.param("fsm/thresh_no_replan", replan_distance_threshold_, -1.0);
   nh.param("fsm/waypoint_num", waypoint_num_, -1);
+  if (waypoint_num_ < 0 || waypoint_num_ > 50) {
+    ROS_WARN("Invalid waypoint count %d; preset goals are disabled.", waypoint_num_);
+    waypoint_num_ = 0;
+  }
   nh.param("fsm/act_map", act_map_, false);
+  bool use_topo_path = false;
+  bool use_optimization = false;
+  nh.param("manager/use_topo_path", use_topo_path, false);
+  nh.param("manager/use_optimization", use_optimization, false);
+  if (!use_topo_path || !use_optimization) {
+    ROS_FATAL("Topo planner requires topology and optimization modules.");
+    throw std::runtime_error("Invalid Topo planner module configuration");
+  }
   for (int i = 0; i < waypoint_num_; i++) {
     nh.param("fsm/waypoint" + to_string(i) + "_x", waypoints_[i][0], -1.0);
     nh.param("fsm/waypoint" + to_string(i) + "_y", waypoints_[i][1], -1.0);
@@ -65,7 +80,15 @@ void TopoReplanFSM::init(ros::NodeHandle& nh) {
 }
 
 void TopoReplanFSM::waypointCallback(const nav_msgs::PathConstPtr& msg) {
+  if (!msg || msg->poses.empty()) {
+    ROS_WARN_THROTTLE(1.0, "Ignore empty waypoint path.");
+    return;
+  }
   if (msg->poses[0].pose.position.z < -0.1) return;
+  if (target_type_ == TARGET_TYPE::PRESET_TARGET && waypoint_num_ == 0) {
+    ROS_ERROR_THROTTLE(1.0, "Preset target has no valid waypoints.");
+    return;
+  }
   cout << "Triggered!" << endl;
 
   vector<Eigen::Vector3d> global_wp;
@@ -369,7 +392,10 @@ void TopoReplanFSM::checkCollisionCallback(const ros::TimerEvent& e) {
   }
 }
 
-bool TopoReplanFSM::callSearchAndOptimization() {}
+bool TopoReplanFSM::callSearchAndOptimization() {
+  ROS_ERROR_THROTTLE(1.0, "callSearchAndOptimization is not implemented.");
+  return false;
+}
 
 bool TopoReplanFSM::callTopologicalTraj(int step) {
   bool plan_success;

@@ -24,7 +24,6 @@
 
 
 #include <path_searching/topo_prm.h>
-#include <sstream>
 #include <thread>
 #include <unordered_set>
 
@@ -88,92 +87,15 @@ bool visLineStep_ = false;
 std::string file_path_;
 
 namespace fast_planner {
+namespace {
+
+constexpr double kTCBSScoreTieEpsilon = 1e-9;
+
+}  // namespace
+
 TopologyPRM::TopologyPRM(/* args */) {}
 
 TopologyPRM::~TopologyPRM() {}
-
-void TopologyPRM::checkSelectedInvariant(const char* context) const {
-  std::size_t selected_count = 0;
-  uint64_t selected_path_id = 0;
-  const auto count_selected = [&selected_count, &selected_path_id](
-                                  const vector<TopoPath>& paths) {
-    for (const auto& path : paths) {
-      if (!path.selected) continue;
-      ++selected_count;
-      selected_path_id = path.path_id;
-    }
-  };
-  count_selected(path_container_front_);
-  count_selected(path_container_back_);
-  if (selected_count > 1) {
-    ROS_ERROR_STREAM("[ECTS] selected invariant violated after " << context
-                     << ": selected_count=" << selected_count);
-  } else {
-    ROS_DEBUG_STREAM_THROTTLE(
-        2.0, "[ECTS] selected invariant context=" << context
-             << " selected_count=" << selected_count
-             << " active="
-             << (selected_count == 0 ? std::string("none")
-                                     : std::to_string(selected_path_id)));
-  }
-}
-
-void TopologyPRM::recordCandidateRejected() {
-  ++ects_counters_.candidate_reject_count;
-}
-
-void TopologyPRM::invalidateSelectedTopology(TopoPath& path,
-                                             const char* reason) {
-  if (!path.selected) return;
-  active_topology_invalid_ = true;
-  invalid_active_path_id_ = path.path_id;
-  invalid_active_path_ = path.path;
-  path.selected = false;
-  ects_diagnostics_.active = std::to_string(path.path_id);
-  ROS_WARN_STREAM_THROTTLE(
-      1.0, "[ECTS] committed ACTIVE topology path_id=" << path.path_id
-           << " explicitly invalidated: " << reason);
-  logEctsEvent("ACTIVE_INVALID", false, false, false, true);
-  checkSelectedInvariant("invalidateSelectedTopology");
-}
-
-void TopologyPRM::logEctsEvent(const std::string& decision,
-                               bool planning_success,
-                               bool candidate_valid, bool commit,
-                               bool throttle) const {
-  std::ostringstream message;
-  message << "[ECTS] active=" << ects_diagnostics_.active
-          << " keep=" << ects_diagnostics_.keep
-          << " challenger=" << ects_diagnostics_.challenger
-          << " J_keep=" << ects_diagnostics_.keep_cost
-          << " J_challenger=" << ects_diagnostics_.challenger_cost
-          << " G=" << ects_diagnostics_.gain
-          << " D_keep=" << ects_diagnostics_.keep_dubins_length
-          << " D_challenger=" << ects_diagnostics_.challenger_dubins_length
-          << " C=" << ects_diagnostics_.connection_penalty
-          << " M=" << ects_diagnostics_.margin
-          << " decision=" << decision
-          << " planning_success=" << std::boolalpha << planning_success
-          << " candidate_valid=" << candidate_valid
-          << " commit=" << commit
-          << " topology_switch_count="
-          << ects_counters_.topology_switch_count
-          << " topology_reversal_count="
-          << ects_counters_.topology_reversal_count
-          << " candidate_reject_count="
-          << ects_counters_.candidate_reject_count
-          << " commit_count=" << ects_counters_.commit_count;
-
-  if (decision == "CANDIDATE_REJECTED") {
-    ROS_WARN_STREAM_THROTTLE(1.0, message.str());
-  } else if (decision == "COMMIT_SUCCESS") {
-    ROS_INFO_STREAM_THROTTLE(1.0, message.str());
-  } else if (throttle) {
-    ROS_DEBUG_STREAM_THROTTLE(1.0, message.str());
-  } else {
-    ROS_DEBUG_STREAM(message.str());
-  }
-}
 
 void TopologyPRM::init(ros::NodeHandle& nh) {
   graph_.clear();
@@ -195,17 +117,6 @@ void TopologyPRM::init(ros::NodeHandle& nh) {
   nh.param("topo_prm/max_raw_path2", max_raw_path2_, -1);
   nh.param("topo_prm/parallel_shortcut", parallel_shortcut_, false);
   nh.param("topo_prm/FilePath", file_path_);
-  double wheel_base = 0.8;
-  double steering_angle_deg = 30.0;
-  nh.param("search_2D/wheel_base", wheel_base, wheel_base);
-  nh.param("search_2D/steering_angle", steering_angle_deg, steering_angle_deg);
-  if (!std::isfinite(wheel_base) || wheel_base <= 0.0) wheel_base = 0.8;
-  if (!std::isfinite(steering_angle_deg) || steering_angle_deg <= 0.0 ||
-      steering_angle_deg >= 90.0) {
-    steering_angle_deg = 30.0;
-  }
-  dubins_turning_radius_ =
-      wheel_base / std::tan(steering_angle_deg * 3.14159265358979323846 / 180.0);
   resolution_ = edt_environment_->sdf_map_->getResolution();
   offset_ = Eigen::Vector3d(0.5, 0.5, 0.5) - edt_environment_->sdf_map_->getOrigin() / resolution_;
 
@@ -261,17 +172,6 @@ void TopologyPRM::initForTest(ros::NodeHandle& nh) {
   nh.param("topo_prm/max_raw_path2", max_raw_path2_, 100);
   nh.param("topo_prm/parallel_shortcut", parallel_shortcut_, true);
   nh.param("topo_prm/FilePath", file_path_);
-  double wheel_base = 0.8;
-  double steering_angle_deg = 30.0;
-  nh.param("search_2D/wheel_base", wheel_base, wheel_base);
-  nh.param("search_2D/steering_angle", steering_angle_deg, steering_angle_deg);
-  if (!std::isfinite(wheel_base) || wheel_base <= 0.0) wheel_base = 0.8;
-  if (!std::isfinite(steering_angle_deg) || steering_angle_deg <= 0.0 ||
-      steering_angle_deg >= 90.0) {
-    steering_angle_deg = 30.0;
-  }
-  dubins_turning_radius_ =
-      wheel_base / std::tan(steering_angle_deg * 3.14159265358979323846 / 180.0);
   sampled_points_.reserve(max_sample_num_);  
   resolution_ = edt_environment_->sdf_map_->getResolution();
   offset_ = Eigen::Vector3d(0.5, 0.5, 0.5) - edt_environment_->sdf_map_->getOrigin() / resolution_;
@@ -729,8 +629,18 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   //   int debug = 0;
   // }
 
-  // early check，这个肯定是需要的
-  if(skip_mode >= 0 && use_skip_ && (dis_pt < 2 * clearance_line_)) return true;
+  const auto& map = edt_environment_->sdf_map_;
+  if (only2D_ ? (!map->isInMap2D(Eigen::Vector2d(p1.head<2>())) ||
+                 !map->isInMap2D(Eigen::Vector2d(p2.head<2>())))
+              : (!map->isInMap(p1) || !map->isInMap(p2))) {
+    pc = p2;
+    return false;
+  }
+  if (dis_pt < 1e-9) {
+    pc = p1;
+    return (only2D_ ? map->getDistance2D(Eigen::Vector2d(p1.head<2>()))
+                    : map->getDistance(p1)) > thresh;
+  }
 
   // edge_pt只在检查两个点是否free时使用，其他检测线free时不使用
   // 判断这个点是不是edge上的点，如果是，则使用0.5 * thresh来检测距离
@@ -746,7 +656,7 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   else
   {
     step_num = ceil(skip_scale * (std::abs(dir.x()) + std::abs(dir.y())) / dis_pt);
-    step_num = min(max(1, step_num), (int)floor(dis_pt / resolution_));     
+    step_num = min(max(1, step_num), max(1, (int)floor(dis_pt / resolution_)));
   }
 
   // if(skip_mode > 0 && dis_pt > 0.7) 
@@ -757,7 +667,7 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   int iter = 0;
   // while会跳过最后一个点
   while (casters_[caster_id].step(ray_pt)) {
-    if(skip_mode >= 1 && (iter == 0 || (iter % step_num) != 0)) 
+    if(skip_mode >= 1 && (iter % step_num) != 0)
     {
         ++iter;
         continue;
@@ -770,10 +680,17 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
     // }
     pt_id_2d(0) = ray_pt(0) + offset_(0);
     pt_id_2d(1) = ray_pt(1) + offset_(1);
+    pt_id(0) = pt_id_2d(0);
+    pt_id(1) = pt_id_2d(1);
+    pt_id(2) = ray_pt(2) + offset_(2);
     dist = only2D_ ? edt_environment_->sdf_map_->getDistance2D(pt_id_2d) : edt_environment_->sdf_map_->getDistance(pt_id);
     if (dist <= (thresh)) {
-      edt_environment_->sdf_map_->indexToPos2D(pt_id_2d, pc);//pc是碰撞点
-      pc.z() = ground_height_;
+      if (only2D_) {
+        map->indexToPos2D(pt_id_2d, pc);
+        pc.z() = ground_height_;
+      } else {
+        map->indexToPos(pt_id, pc);
+      }
       return false;
     }
   }
@@ -787,18 +704,17 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   // }
   // return true;
 
-  //  这里就是ray_pt_end，不能改
-  // TODO，这里是有错的！！
-  Eigen::Vector2i end_id;
-  end_id(0) = ray_pt(0) + offset_(0);
-  end_id(1) = ray_pt(1) + offset_(1);
-  dist = only2D_ ? edt_environment_->sdf_map_->getDistance2D(end_id) : edt_environment_->sdf_map_->getDistance(pt_id);
-  Eigen::Vector3d pt_tmp;
-  edt_environment_->sdf_map_->indexToPos2D(end_id, pt_tmp);
+  const Eigen::Vector3i end_id_3d = (p2 / resolution_ + offset_).cast<int>();
+  const Eigen::Vector2i end_id = end_id_3d.head<2>();
+  dist = only2D_ ? map->getDistance2D(end_id) : map->getDistance(end_id_3d);
   
   if (dist <= (thresh)) {
-    edt_environment_->sdf_map_->indexToPos2D(end_id, pc);
-    pc.z() = ground_height_;
+    if (only2D_) {
+      map->indexToPos2D(end_id, pc);
+      pc.z() = ground_height_;
+    } else {
+      map->indexToPos(end_id_3d, pc);
+    }
     return false;
   }
   return true;
@@ -842,9 +758,21 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::pruneEquivalent(const vector<vector
   vector<int> exist_paths_id;
   vector<std::pair<int, double>> scored_candidates;
   scored_candidates.reserve(paths.size());
-  for (size_t index = 0; index < paths.size(); ++index) {
-    scored_candidates.emplace_back(static_cast<int>(index),
-                                   evaluatePathCost(paths[index]).total_cost);
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
+  }
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    scored_candidates.emplace_back(static_cast<int>(selected_indices[index]),
+                                   costs[index].total_cost);
   }
   std::sort(scored_candidates.begin(), scored_candidates.end(),
             [](const std::pair<int, double>& lhs, const std::pair<int, double>& rhs) {
@@ -856,32 +784,22 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::pruneEquivalent(const vector<vector
     const int i = scored_candidate.first;
     // compare with exsit paths
     bool new_path = true;
-    bool same_as_active = false;
-    bool same_as_inactive = false;
-    const auto classify_against_history =
-        [this, &paths, i, &same_as_active, &same_as_inactive](
-            const vector<TopoPath>& history) {
-          for (const auto& exist_path : history) {
-            if (!sameTopoPath(paths[i], exist_path.path, 0.0, true)) continue;
-            if (exist_path.selected)
-              same_as_active = true;
-            else
-              same_as_inactive = true;
-          }
-        };
-    classify_against_history(path_container_front_);
-    classify_against_history(path_container_back_);
-    if (active_topology_invalid_ && !invalid_active_path_.empty() &&
-        sameTopoPath(paths[i], invalid_active_path_, 0.0, true)) {
-      same_as_active = true;
-    } else if (!last_best_path_.empty() &&
-               sameTopoPath(paths[i], last_best_path_, 0.0, true)) {
-      same_as_active = true;
+    for(const auto& exist_path : path_container_front_)
+    {
+      bool same_topo = sameTopoPath(paths[i], exist_path.path, 0.0, true);
+      if (same_topo) {
+        new_path = false;
+        break;
+      }
     }
-    // Keep one fresh representative of the active topology so ECTS can choose
-    // A -> A' as a within-class update. Other historical topology duplicates
-    // remain filtered as before.
-    if (!same_as_active && same_as_inactive) new_path = false;
+    if (new_path) {
+      for (const auto& exist_path : path_container_back_) {
+        if (sameTopoPath(paths[i], exist_path.path, 0.0, true)) {
+          new_path = false;
+          break;
+        }
+      }
+    }
     // 如果和现在容器里的对比，都不是new_path，则不必再和其他的对比了。
     if(!new_path) continue;
 
@@ -925,17 +843,23 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::selectShortPaths(vector<vector<Eige
   /* ---------- only reserve top short path ---------- */
   vector<vector<Eigen::Vector3d>> short_paths;
   vector<Eigen::Vector3d> short_path;
-  double min_cost;
+  double min_cost = std::numeric_limits<double>::infinity();
 
   // 这里还不如直接把全部都算出来，然后排序呢
   for (int i = 0; i < reserve_num_ && paths.size() > 0; ++i) {
     int path_id = shortestPath(paths);
+    if (path_id < 0 || static_cast<size_t>(path_id) >= paths.size()) {
+      ROS_WARN_THROTTLE(1.0, "No feasible candidate remains in selectShortPaths.");
+      break;
+    }
     if (i == 0) {
       short_paths.push_back(paths[path_id]);
       min_cost = evaluatePathCost(paths[path_id]).total_cost;
       paths.erase(paths.begin() + path_id);
     } else {
-      double rat = evaluatePathCost(paths[path_id]).total_cost / min_cost;
+      const double rat = min_cost > 1e-9
+                             ? evaluatePathCost(paths[path_id]).total_cost / min_cost
+                             : std::numeric_limits<double>::infinity();
       if (rat < ratio_to_short_) {
         short_paths.push_back(paths[path_id]);
         paths.erase(paths.begin() + path_id);
@@ -971,17 +895,53 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
 
   vector<TopoPath> candidates;
   candidates.reserve(paths.size());
-  for (const auto& path : paths) {
-    candidates.emplace_back(path, evaluatePathCost(path));
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
   }
+  const auto append_stored_costs = [&](const vector<TopoPath>& stored_paths) {
+    for (const auto& stored : stored_paths) {
+      RiskPathCost cost;
+      cost.length = stored.length;
+      cost.risk = stored.risk;
+      cost.curvature_cost = stored.curvature_cost;
+      for (const auto& edge : stored.risk_edges)
+        cost.maximum_risk = std::max(cost.maximum_risk, edge.maximum_risk);
+      if (risk_aware_edge_) {
+        const auto& weights = risk_aware_edge_->getParameters();
+        cost.total_cost = weights.alpha * cost.length +
+                          weights.beta * cost.risk +
+                          weights.gamma * cost.curvature_cost;
+      } else {
+        cost.total_cost = stored.total_cost;
+      }
+      costs.push_back(cost);
+    }
+  };
+  append_stored_costs(path_container_front_);
+  append_stored_costs(path_container_back_);
+  if (risk_aware_edge_) risk_aware_edge_->normalizeCandidateCosts(costs);
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    candidates.emplace_back(paths[selected_indices[index]], costs[index]);
+  }
+  size_t stored_index = selected_indices.size();
+  for (auto& stored : path_container_front_) stored.total_cost = costs[stored_index++].total_cost;
+  for (auto& stored : path_container_back_) stored.total_cost = costs[stored_index++].total_cost;
+  std::sort(path_container_front_.begin(), path_container_front_.end());
+  std::sort(path_container_back_.begin(), path_container_back_.end());
   std::sort(candidates.begin(), candidates.end());
 
   double minCost = std::numeric_limits<double>::max();
   int new_insert_path_count = 0;
   for (auto newPath : candidates) {
-    // New paths are uncommitted Candidates. selected may only be set by
-    // commitPendingGuideCandidate().
-    newPath.selected = false;
     newPath.path_id = next_path_id_++;
     newPath.validated_map_revision =
         edt_environment_->sdf_map_->getLatestMapChangeSet().revision;
@@ -997,17 +957,7 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
         ++ new_insert_path_count;
         // 如果前部分超出容量，删除最长路径
         if (path_container_front_.size() > path_container_size_half_) {
-            auto remove_it = std::find_if(path_container_front_.rbegin(),
-                                          path_container_front_.rend(),
-                                          [](const TopoPath& path) {
-                                            return !path.selected;
-                                          });
-            if (remove_it != path_container_front_.rend()) {
-              path_container_front_.erase(std::prev(remove_it.base()));
-            } else {
-              ROS_DEBUG_THROTTLE(
-                  2.0, "[ECTS] front capacity exceeded to preserve committed ACTIVE");
-            }
+            path_container_front_.pop_back();
         }
     }
     // 插入到后部分
@@ -1020,17 +970,7 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
 
         // 如果后部分超出容量，删除最短路径
         if (path_container_back_.size() > path_container_size_half_) {
-            auto remove_it = std::find_if(path_container_back_.begin(),
-                                          path_container_back_.end(),
-                                          [](const TopoPath& path) {
-                                            return !path.selected;
-                                          });
-            if (remove_it != path_container_back_.end()) {
-              path_container_back_.erase(remove_it);
-            } else {
-              ROS_DEBUG_THROTTLE(
-                  2.0, "[ECTS] back capacity exceeded to preserve committed ACTIVE");
-            }
+            path_container_back_.erase(path_container_back_.begin());
         }
     }
   }
@@ -1042,11 +982,8 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
   if(!isNonDecreasing(path_container_front_)) ROS_ERROR("Wrong path_container_front_!");
   if(!isNonDecreasing(path_container_back_)) ROS_ERROR("Wrong path_container_back_!");
   // if(path_container_front_.back().length > path_container_back_.front().length) ROS_ERROR("Wrong path between front and back!");
-  ROS_DEBUG_STREAM_THROTTLE(
-      2.0, "Front size: " << path_container_front_.size()
-           << ", Back size: " << path_container_back_.size()
-           << ", New insert path count (close set): "
-           << new_insert_path_count);
+  ROS_WARN_STREAM("Front size: " << path_container_front_.size() << ", Back size: " << path_container_back_.size() << 
+                  ", New insert path count (close set): " << new_insert_path_count);
   // static int last_size = path_container_front_.size();
   // if(path_container_front_.size() == 1 && last_size > 1) ros::Duration(10).sleep();
   // last_size = path_container_front_.size();
@@ -1061,7 +998,6 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
       record_data_.path_lengths[path_num] = path_container_back_[i].length;
   }
   logPathCosts();
-  checkSelectedInvariant("selectShortPathsV2");
 }
 
 
@@ -1144,10 +1080,22 @@ bool TopologyPRM::sameTopoPath(const vector<Eigen::Vector3d>& path1,
 int TopologyPRM::shortestPath(vector<vector<Eigen::Vector3d>>& paths) {
   int short_id = -1;
   double min_cost = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < paths.size(); ++i) {
-    const double cost = evaluatePathCost(paths[i]).total_cost;
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
+  }
+  for (size_t i = 0; i < selected_indices.size(); ++i) {
+    const double cost = costs[i].total_cost;
     if (short_id < 0 || cost < min_cost) {
-      short_id = i;
+      short_id = static_cast<int>(selected_indices[i]);
       min_cost = cost;
     }
   }
@@ -1177,13 +1125,52 @@ void TopologyPRM::updatePathCost(TopoPath& path) {
   path.risk_edges = cost.edges;
 }
 
+bool TopologyPRM::isBetterTCBSCandidate(const TopoPath& candidate,
+                                        const TopoPath* best) const {
+  if (!candidate.tcbs_score.feasible) return false;
+  if (best == nullptr) return true;
+
+  const double candidate_score = candidate.tcbs_score.bottleneck;
+  const double best_score = best->tcbs_score.bottleneck;
+  if (candidate_score < best_score - kTCBSScoreTieEpsilon) return true;
+  if (std::abs(candidate_score - best_score) > kTCBSScoreTieEpsilon) return false;
+
+  // Stable secondary ordering for equal bottleneck scores: shorter path first,
+  // then the persistent path instance ID.
+  if (candidate.length < best->length - kTCBSScoreTieEpsilon) return true;
+  if (std::abs(candidate.length - best->length) > kTCBSScoreTieEpsilon) return false;
+  return candidate.path_id < best->path_id;
+}
+
+void TopologyPRM::findBestTCBSCandidates(const vector<TopoPath*>& candidates,
+                                         int& keep_index,
+                                         int& challenger_index) {
+  keep_index = -1;
+  challenger_index = -1;
+  const bool has_current_topology = !last_best_path_.empty();
+
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    TopoPath* candidate = candidates[index];
+    if (!candidate->tcbs_score.feasible) continue;
+
+    // A Keep candidate belongs to the currently selected topology H_t; every
+    // other feasible candidate is a Challenger.
+    const bool is_keep = has_current_topology &&
+        sameTopoPath(candidate->path, last_best_path_, 0.0, true);
+    int& best_index = is_keep ? keep_index : challenger_index;
+    const TopoPath* best = best_index >= 0 ? candidates[best_index] : nullptr;
+    if (isBetterTCBSCandidate(*candidate, best)) {
+      best_index = static_cast<int>(index);
+    }
+  }
+}
+
 void TopologyPRM::logPathCosts() const {
   const vector<TopologicalPathCost> costs = getPathCosts();
   for (size_t index = 0; index < costs.size(); ++index) {
-    ROS_DEBUG_STREAM_THROTTLE(
-        2.0, "[RiskTopo] path[" << index << "] {length: "
-             << costs[index].length << ", risk: " << costs[index].risk
-             << ", total_cost: " << costs[index].total_cost << "}");
+    ROS_INFO_STREAM("[RiskTopo] path[" << index << "] {length: "
+                    << costs[index].length << ", risk: " << costs[index].risk
+                    << ", total_cost: " << costs[index].total_cost << "}");
   }
 }
 double TopologyPRM::pathLength(const vector<Eigen::Vector3d>& path) {
@@ -1474,9 +1461,21 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::searchPaths() {
 
   vector<std::pair<double, int>> ranked_paths;
   ranked_paths.reserve(raw_paths_.size());
-  for (size_t index = 0; index < raw_paths_.size(); ++index) {
-    ranked_paths.emplace_back(evaluatePathCost(raw_paths_[index]).total_cost,
-                              static_cast<int>(index));
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(raw_paths_, selected_indices, costs);
+  } else {
+    costs.reserve(raw_paths_.size());
+    selected_indices.reserve(raw_paths_.size());
+    for (size_t index = 0; index < raw_paths_.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(raw_paths_[index]));
+    }
+  }
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    ranked_paths.emplace_back(costs[index].total_cost,
+                              static_cast<int>(selected_indices[index]));
   }
   std::sort(ranked_paths.begin(), ranked_paths.end(),
             [](const std::pair<double, int>& lhs, const std::pair<double, int>& rhs) {
@@ -1927,8 +1926,7 @@ vector<Eigen::Vector3d> TopologyPRM::findDubinsShots(const Eigen::Vector3d& star
   if(minPathIdx < 0)
   {
     ROS_ERROR("Also Can not find dubins shot in path_container_back_! ERROR!");  
-    minPathIdx = 0;  
-    return path_container_front_[0].path;
+    return {};
   }
 
   // publishTestPath(dubins_shot_paths_[minPathIdx], 1); 
@@ -1936,39 +1934,25 @@ vector<Eigen::Vector3d> TopologyPRM::findDubinsShots(const Eigen::Vector3d& star
 }
 
 
-// Select the best_path by maximizing risk-aware utility. Orientation remains
-// the tie breaker for candidates with near-equal utility.
+// Select the guide path with the legacy risk-aware utility, or with TCBS
+// Keep/Challenger separation when the opt-in switch is enabled.
 vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase) {
-  discardPendingGuideCandidate();
-  ects_diagnostics_ = EctsDiagnostics();
-  if(path_container_front_.empty() && path_container_back_.empty()) return {};
-
-  TopoPath* active_topology = nullptr;
-  const auto find_active = [&active_topology](vector<TopoPath>& paths) {
-    for (auto& path : paths) {
-      if (!path.selected) continue;
-      if (!active_topology) {
-        active_topology = &path;
-      } else {
-        ROS_WARN_STREAM("[ECTS] multiple active paths detected; ignoring path_id="
-                        << path.path_id);
-      }
-    }
-  };
-  find_active(path_container_front_);
-  find_active(path_container_back_);
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  const bool tcbs_enabled = risk_aware_path_selector_ &&
+      risk_aware_path_selector_->getParameters().enable_tcbs;
+  ++tcbs_statistics_.planning_cycle_count;
+  if(path_container_front_.empty() && path_container_back_.empty()) {
+    ROS_DEBUG_STREAM("[TCBS] mode=" << (tcbs_enabled ? "TCBS" : "BASELINE")
+                     << " cycle=" << tcbs_statistics_.planning_cycle_count
+                     << " decision=FAIL reason=no_candidates");
+    return {};
+  }
 
   std::vector<TopoPath*> candidates;
   candidates.reserve(path_container_front_.size() + path_container_back_.size());
-  for (auto& candidate : path_container_front_) {
-    if (candidate.safty && candidate.state != TopoPath::INVALID)
-      candidates.push_back(&candidate);
-  }
-  for (auto& candidate : path_container_back_) {
-    if (candidate.safty && candidate.state != TopoPath::INVALID)
-      candidates.push_back(&candidate);
-  }
-  if (candidates.empty()) return {};
+  for (auto& candidate : path_container_front_) candidates.push_back(&candidate);
+  for (auto& candidate : path_container_back_) candidates.push_back(&candidate);
 
   std::vector<PathSelectionCandidate> selection_candidates;
   selection_candidates.reserve(candidates.size());
@@ -1977,6 +1961,18 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
   for (std::size_t index = 0; index < candidates.size(); ++index) {
     TopoPath* candidate = candidates[index];
     updatePathCost(*candidate);
+    if (tcbs_enabled) {
+      candidate->tcbs_score = risk_aware_path_selector_->evaluateTCBSScore(
+          candidate->path, candidate->length, candidate->risk);
+      candidate->tcbs_score.feasible = candidate->tcbs_score.feasible &&
+          candidate->safty && candidate->state == TopoPath::VALID;
+      ROS_DEBUG_STREAM("[TCBS] candidate path_id=" << candidate->path_id
+                       << " E=" << candidate->tcbs_score.efficiency
+                       << " R=" << candidate->tcbs_score.risk
+                       << " B=" << candidate->tcbs_score.bottleneck
+                       << " feasible=" << std::boolalpha
+                       << candidate->tcbs_score.feasible);
+    }
     PathSelectionCandidate selection_candidate;
     selection_candidate.path = candidate->path;
     selection_candidate.length = candidate->length;
@@ -2003,265 +1999,310 @@ vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_
     selection.best_path = candidates.front()->path;
   }
 
-  std::size_t selected_index = selection.best_index;
-  const bool ects_enabled = risk_aware_path_selector_ &&
-      risk_aware_path_selector_->getParameters().ects_enabled;
-  if (ects_enabled && selection.candidate_scores.size() == candidates.size()) {
-    const std::size_t no_index = candidates.size();
-    std::size_t active_index = no_index;
-    for (std::size_t index = 0; index < candidates.size(); ++index) {
-      if (candidates[index] == active_topology) {
-        active_index = index;
-        break;
+  if (tcbs_enabled) {
+    int keep_index = -1;
+    int challenger_index = -1;
+    findBestTCBSCandidates(candidates, keep_index, challenger_index);
+
+    int tcbs_best_index = -1;
+    const bool has_current_topology = !last_best_path_.empty();
+    const double eta_switch =
+        risk_aware_path_selector_->getParameters().eta_switch;
+    const double keep_score = keep_index >= 0
+        ? candidates[keep_index]->tcbs_score.bottleneck
+        : std::numeric_limits<double>::infinity();
+    const double challenger_score = challenger_index >= 0
+        ? candidates[challenger_index]->tcbs_score.bottleneck
+        : std::numeric_limits<double>::infinity();
+    const char* decision = "FAIL";
+    const char* reason = "no_feasible_candidate";
+
+    if (keep_index < 0) {
+      // No feasible Keep (including the first planning cycle): use the best
+      // Challenger immediately, without applying switch hysteresis.
+      tcbs_best_index = challenger_index;
+      if (challenger_index >= 0 && has_current_topology) {
+        ++tcbs_statistics_.invalid_keep_count;
+        pending_tcbs_decision_ = TCBSPendingDecision::FORCE_SWITCH;
+        decision = "FORCE_SWITCH";
+        reason = "keep_invalid";
+      } else if (challenger_index >= 0) {
+        pending_tcbs_decision_ = TCBSPendingDecision::INITIAL;
+        decision = "SWITCH";
+        reason = "no_current_topology";
       }
-    }
-
-    std::size_t keep_index = no_index;
-    std::size_t challenger_index = no_index;
-    auto lowerRouteCost = [&selection, no_index](std::size_t candidate_index,
-                                                 std::size_t current_index) {
-      if (current_index == no_index) return true;
-      const PathSelectionScore& candidate_score =
-          selection.candidate_scores[candidate_index];
-      const PathSelectionScore& current_score =
-          selection.candidate_scores[current_index];
-      if (candidate_score.route_cost != current_score.route_cost) {
-        return candidate_score.route_cost < current_score.route_cost;
-      }
-      return candidate_score.orientation_error < current_score.orientation_error;
-    };
-
-    const vector<Eigen::Vector3d>* active_path = nullptr;
-    bool current_topology_invalid = false;
-    std::string active_label = "none";
-    if (active_topology) {
-      active_path = &active_topology->path;
-      current_topology_invalid = active_topology->state == TopoPath::INVALID ||
-                                 !active_topology->safty;
-      active_label = std::to_string(active_topology->path_id);
-    } else if (active_topology_invalid_ && !invalid_active_path_.empty()) {
-      active_path = &invalid_active_path_;
-      current_topology_invalid = true;
-      active_label = std::to_string(invalid_active_path_id_);
-    } else if (!last_best_path_.empty()) {
-      // selected is read-only in the proposal stage. last_best_path_ supplies
-      // the startup reference until trajectory commit owns selected.
-      active_path = &last_best_path_;
-      active_label = "last_best";
-    }
-
-    if (!active_path) {
-      // First-cycle bootstrap has no topology switch to evaluate.
-      keep_index = selected_index;
+    } else if (challenger_index < 0) {
+      tcbs_best_index = keep_index;
+      pending_tcbs_decision_ = TCBSPendingDecision::KEEP;
+      decision = "KEEP";
+      reason = "no_challenger";
     } else {
-      for (std::size_t index = 0; index < candidates.size(); ++index) {
-        const bool same_topology = index == active_index ||
-            sameTopoPath(candidates[index]->path, *active_path, 0.0, true);
-        std::size_t& group_best = same_topology ? keep_index : challenger_index;
-        if (lowerRouteCost(index, group_best)) group_best = index;
+      const double switch_threshold =
+          (1.0 - eta_switch) * keep_score;
+
+      // A topology switch is allowed only when the Challenger is strictly
+      // better than the eta_switch threshold.
+      if (challenger_score < switch_threshold) {
+        tcbs_best_index = challenger_index;
+        pending_tcbs_decision_ = TCBSPendingDecision::SWITCH;
+        decision = "SWITCH";
+        reason = "margin";
+      } else {
+        tcbs_best_index = keep_index;
+        pending_tcbs_decision_ = TCBSPendingDecision::KEEP;
+        ++tcbs_statistics_.challenger_rejected_by_eta_count;
+        decision = "KEEP";
+        reason = "margin";
       }
     }
 
-    const auto pathLabel = [&candidates, no_index](std::size_t index) {
-      return index == no_index ? std::string("none")
-                               : std::to_string(candidates[index]->path_id);
-    };
-    const auto costLabel = [&selection, no_index](std::size_t index) {
-      return index == no_index
-                 ? std::numeric_limits<double>::infinity()
-                 : selection.candidate_scores[index].route_cost;
-    };
+    ROS_DEBUG_STREAM("[TCBS] cycle="
+                     << tcbs_statistics_.planning_cycle_count
+                     << " keep_B=" << keep_score
+                     << " challenger_B=" << challenger_score
+                     << " eta=" << eta_switch
+                     << " decision=" << decision
+                     << " reason=" << reason);
 
-    const double keep_cost = costLabel(keep_index);
-    const double challenger_cost = costLabel(challenger_index);
-    double keep_dubins_length = std::numeric_limits<double>::infinity();
-    double challenger_dubins_length = std::numeric_limits<double>::infinity();
-    dubins_shot_paths_.resize(2);
-    dubins_shot_succ_.resize(2);
-    if (keep_index != no_index) {
-      keep_dubins_length = findDubinsShot(
-          candidates[keep_index]->path, 0, start_state, dubins_turning_radius_);
-    }
-    if (challenger_index != no_index) {
-      challenger_dubins_length = findDubinsShot(
-          candidates[challenger_index]->path, 1, start_state,
-          dubins_turning_radius_);
+    if (tcbs_best_index < 0) {
+      ROS_WARN_THROTTLE(1.0, "TCBS found no feasible Keep or Challenger candidate.");
+      return {};
     }
 
-    TopologySwitchDecision switch_decision;
-    if (challenger_index != no_index && keep_index != no_index) {
-      switch_decision = risk_aware_path_selector_->evaluateTopologySwitch(
-          keep_cost, challenger_cost, keep_dubins_length,
-          challenger_dubins_length, current_topology_invalid);
-    } else if (challenger_index != no_index && current_topology_invalid) {
-      // There is no viable representative of the invalid active topology.
-      switch_decision.propose_switch = true;
-      switch_decision.active_topology_invalid = true;
-      switch_decision.gain = std::numeric_limits<double>::infinity();
-      switch_decision.margin = std::numeric_limits<double>::infinity();
-    }
-
-    ects_diagnostics_.active = active_label;
-    ects_diagnostics_.keep = pathLabel(keep_index);
-    ects_diagnostics_.challenger = pathLabel(challenger_index);
-    ects_diagnostics_.keep_cost = keep_cost;
-    ects_diagnostics_.challenger_cost = challenger_cost;
-    ects_diagnostics_.gain = switch_decision.gain;
-    ects_diagnostics_.keep_dubins_length = keep_dubins_length;
-    ects_diagnostics_.challenger_dubins_length = challenger_dubins_length;
-    ects_diagnostics_.connection_penalty =
-        switch_decision.connection_penalty;
-    ects_diagnostics_.margin = switch_decision.margin;
-
-    std::string decision_label;
-    if (current_topology_invalid) {
-      // ACTIVE_INVALID is an explicit state event. A viable challenger may
-      // subsequently produce a separate proposal event below.
-      logEctsEvent("ACTIVE_INVALID", false, false, false, true);
-    }
-    if (challenger_index == no_index) {
-      decision_label = "KEEP_NO_CHALLENGER";
-    } else if (switch_decision.gain <= 0.0) {
-      decision_label = "KEEP_NO_GAIN";
-    } else if (switch_decision.propose_switch) {
-      decision_label = "TOPO_SWITCH_PROPOSAL";
-    } else {
-      decision_label = "KEEP_COMMITTED";
-    }
-    logEctsEvent(decision_label, false, false, false, true);
-
-    if (switch_decision.propose_switch && challenger_index != no_index) {
-      selected_index = challenger_index;
-      pending_proposal_.valid = true;
-      pending_proposal_.active_path_id = active_topology
-                                             ? active_topology->path_id
-                                             : invalid_active_path_id_;
-      pending_proposal_.challenger_path_id =
-          candidates[challenger_index]->path_id;
-      pending_proposal_.challenger_path =
-          candidates[challenger_index]->path;
-      pending_proposal_.decision = switch_decision;
-    } else if (keep_index != no_index) {
-      selected_index = keep_index;
-    }
-
-    const PathSelectionScore& selected_score =
-        selection.candidate_scores[selected_index];
-    selection.best_index = selected_index;
-    selection.best_path = candidates[selected_index]->path;
-    selection.cost = selected_score.utility;
-    selection.route_cost = selected_score.route_cost;
-    selection.normalized_length = selected_score.normalized_length;
-    selection.normalized_risk = selected_score.normalized_risk;
-    selection.prs_score = selected_score.prs_score;
-    selection.orientation_error = selected_score.orientation_error;
+    selection.best_index = static_cast<std::size_t>(tcbs_best_index);
+    selection.best_path = candidates[selection.best_index]->path;
+    pending_path_id_ = candidates[selection.best_index]->path_id;
+    ROS_DEBUG_STREAM("[TCBS] keep_index=" << keep_index
+                     << " challenger_index=" << challenger_index
+                     << " proposed_path_id="
+                     << candidates[selection.best_index]->path_id);
   }
 
-  const TopoPath& best_path = *candidates[selected_index];
-  pending_guide_candidate_.valid = true;
-  pending_guide_candidate_.from_switch_proposal = pending_proposal_.valid;
-  pending_guide_candidate_.path_id = best_path.path_id;
-  pending_guide_candidate_.sparse_path = selection.best_path;
-  pending_guide_candidate_.guide_path = discretizePath(selection.best_path);
+  const TopoPath& best_path = *candidates[selection.best_index];
+  vector<Eigen::Vector3d> guide_path = discretizePath(selection.best_path);
+  if (!tcbs_enabled) {
+    // Legacy selection is unchanged; record its proposal so baseline and
+    // TCBS topology statistics both count accepted plans at commit time.
+    pending_path_id_ = best_path.path_id;
+  }
   path_pts_sprase = selection.best_path;
+  publishGuidePath(selection.best_path);
 
-  ROS_DEBUG_STREAM_THROTTLE(
-      2.0, "[RiskPathSelector] best_path {length: " << best_path.length
-           << ", risk: " << best_path.risk
-           << ", route_cost: " << selection.route_cost
-           << ", utility: " << selection.cost
-           << ", normalized_length: " << selection.normalized_length
-           << ", normalized_risk: " << selection.normalized_risk
-           << ", prs_score: " << selection.prs_score
-           << ", reliability_enabled: " << std::boolalpha
-           << selection.reliability_enabled
-           << ", lambda_length: " << selection.lambda_length
-           << ", lambda_risk: " << selection.lambda_risk
-           << ", lambda_prs: " << selection.lambda_prs
-           << ", w1: " << selection.w1
-           << ", w2: " << selection.w2
-           << ", average_risk: " << selection.average_risk
-           << ", average_corridor_width: "
-           << selection.average_corridor_width
-           << ", orientation_error: " << selection.orientation_error << "}");
-  return pending_guide_candidate_.guide_path;
+  if (tcbs_enabled) {
+    ROS_DEBUG_STREAM("[TCBS] proposed path_id=" << best_path.path_id
+                     << " E=" << best_path.tcbs_score.efficiency
+                     << " R=" << best_path.tcbs_score.risk
+                     << " B=" << best_path.tcbs_score.bottleneck);
+  } else {
+    ROS_INFO_STREAM("[RiskPathSelector] best_path {length: " << best_path.length
+                    << ", risk: " << best_path.risk
+                    << ", cost: " << selection.cost
+                    << ", normalized_length: " << selection.normalized_length
+                    << ", normalized_risk: " << selection.normalized_risk
+                    << ", prs_score: " << selection.prs_score
+                    << ", reliability_enabled: " << std::boolalpha
+                    << selection.reliability_enabled
+                    << ", lambda_length: " << selection.lambda_length
+                    << ", lambda_risk: " << selection.lambda_risk
+                    << ", lambda_prs: " << selection.lambda_prs
+                    << ", w1: " << selection.w1
+                    << ", w2: " << selection.w2
+                    << ", average_risk: " << selection.average_risk
+                    << ", average_corridor_width: "
+                    << selection.average_corridor_width
+                    << ", orientation_error: " << selection.orientation_error << "}");
+  }
+  return guide_path; // 需要返回的是稠密的路径点。
 }
 
-bool TopologyPRM::commitPendingGuideCandidate() {
-  if (!pending_guide_candidate_.valid) return false;
+void TopologyPRM::commitGuidePath(
+    const vector<Eigen::Vector3d>& accepted_path) {
+  (void)tryCommitGuidePath(accepted_path);
+}
 
-  TopoPath* committed_path = nullptr;
-  TopoPath* previous_active = nullptr;
-  const auto find_active = [&previous_active](vector<TopoPath>& paths) {
-    for (auto& path : paths) {
-      if (!path.selected) continue;
-      if (!previous_active) previous_active = &path;
-    }
-  };
-  find_active(path_container_front_);
-  find_active(path_container_back_);
-  const auto find_by_id = [this, &committed_path](vector<TopoPath>& paths) {
-    for (auto& path : paths) {
-      if (path.path_id == pending_guide_candidate_.path_id) {
-        committed_path = &path;
-        return;
-      }
-    }
-  };
-  find_by_id(path_container_front_);
-  if (!committed_path) find_by_id(path_container_back_);
-  if (!committed_path || !committed_path->safty ||
-      committed_path->state == TopoPath::INVALID) {
-    ROS_WARN_STREAM_THROTTLE(1.0, "[ECTS] pending topology path_id="
-                    << pending_guide_candidate_.path_id
-                    << " is no longer valid");
+bool TopologyPRM::tryCommitGuidePath(
+    const vector<Eigen::Vector3d>& accepted_path) {
+  const bool tcbs_enabled = risk_aware_path_selector_ &&
+      risk_aware_path_selector_->getParameters().enable_tcbs;
+  if (!tcbs_enabled && pending_path_id_ == 0) return true;
+  if (pending_path_id_ == 0 || accepted_path.empty()) {
     return false;
   }
 
-  vector<Eigen::Vector3d> previous_topology_path;
-  if (previous_active) {
-    previous_topology_path = previous_active->path;
-  } else if (active_topology_invalid_ && !invalid_active_path_.empty()) {
-    previous_topology_path = invalid_active_path_;
+  // Candidate comparison only creates a proposal. Commit current topology
+  // after the downstream planner has accepted its resulting trajectory.
+  const TopoPath* selected_path = nullptr;
+  auto find_pending_path = [&](const vector<TopoPath>& container) {
+    auto iter = std::find_if(container.begin(), container.end(),
+                             [&](const TopoPath& path) {
+                               return path.path_id == pending_path_id_;
+                             });
+    return iter == container.end() ? nullptr : &(*iter);
+  };
+  selected_path = find_pending_path(path_container_front_);
+  if (!selected_path) selected_path = find_pending_path(path_container_back_);
+  if (!selected_path) {
+    ROS_WARN_THROTTLE(
+        1.0, "TCBS accepted path is no longer in the topology container; "
+             "keeping the previously committed topology.");
+    pending_path_id_ = 0;
+    pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+    return !tcbs_enabled;
   }
 
-  bool topology_changed = false;
-  bool topology_reversal = false;
-  if (!previous_topology_path.empty()) {
-    topology_changed = !sameTopoPath(previous_topology_path,
-                                     committed_path->path, 0.0, true);
-    if (topology_changed && !previous_committed_topology_path_.empty()) {
-      topology_reversal = sameTopoPath(
-          committed_path->path, previous_committed_topology_path_, 0.0, true);
+  const auto& guide = selected_path->path;
+  if (!tcbs_enabled) {
+    const bool had_current_topology = !last_best_path_.empty();
+    const bool topology_changed = had_current_topology &&
+        !sameTopoPath(guide, last_best_path_, 0.0, true);
+    const bool topology_reversed = topology_changed &&
+        !previous_committed_topology_.empty() &&
+        sameTopoPath(guide, previous_committed_topology_, 0.0, true);
+    if (had_current_topology) {
+      if (topology_changed) {
+        ++tcbs_statistics_.topology_switch_count;
+        previous_committed_topology_ = last_best_path_;
+      } else {
+        ++tcbs_statistics_.topology_keep_count;
+      }
+    }
+    if (topology_reversed) ++tcbs_statistics_.topology_reversal_count;
+    last_best_path_ = guide;
+    pending_path_id_ = 0;
+    ROS_DEBUG_STREAM("[TCBS] mode=BASELINE accepted_stats planning_cycles="
+                     << tcbs_statistics_.planning_cycle_count
+                     << " topology_switches="
+                     << tcbs_statistics_.topology_switch_count
+                     << " topology_keeps="
+                     << tcbs_statistics_.topology_keep_count
+                     << " topology_reversals="
+                     << tcbs_statistics_.topology_reversal_count);
+    return true;
+  }
+
+  // Hybrid A* may return a local trajectory before reaching the goal. Compare
+  // it with the corresponding prefix of the proposed topology, rather than
+  // stretching a short local trajectory against the entire guide path.
+  vector<Eigen::Vector3d> guide_prefix;
+  if (accepted_path.size() < 2 || guide.size() < 2) return false;
+  const Eigen::Vector2d endpoint = accepted_path.back().head<2>();
+  double nearest_distance_sq = std::numeric_limits<double>::infinity();
+  size_t nearest_segment = 0;
+  Eigen::Vector3d projected_point = guide.front();
+  for (size_t i = 0; i + 1 < guide.size(); ++i) {
+    const Eigen::Vector2d segment =
+        (guide[i + 1] - guide[i]).head<2>();
+    const double length_sq = segment.squaredNorm();
+    const double fraction = length_sq > 0.0
+        ? std::max(0.0, std::min(1.0,
+            (endpoint - guide[i].head<2>()).dot(segment) / length_sq))
+        : 0.0;
+    const Eigen::Vector3d projection =
+        guide[i] + fraction * (guide[i + 1] - guide[i]);
+    const double distance_sq =
+        (endpoint - projection.head<2>()).squaredNorm();
+    if (distance_sq < nearest_distance_sq) {
+      nearest_distance_sq = distance_sq;
+      nearest_segment = i;
+      projected_point = projection;
     }
   }
+  guide_prefix.assign(guide.begin(), guide.begin() + nearest_segment + 1);
+  guide_prefix.push_back(projected_point);
 
-  // This is the sole normal selected-state transition. Proposal and
-  // Candidate construction never mutate the committed ACTIVE marker.
-  for (auto& path : path_container_front_) path.selected = false;
-  for (auto& path : path_container_back_) path.selected = false;
-  committed_path->selected = true;
-  last_best_path_ = pending_guide_candidate_.guide_path;
-  publishGuidePath(pending_guide_candidate_.sparse_path);
-  active_topology_invalid_ = false;
-  invalid_active_path_.clear();
-  invalid_active_path_id_ = 0;
-
-  if (topology_changed) {
-    ++ects_counters_.topology_switch_count;
-    if (topology_reversal) ++ects_counters_.topology_reversal_count;
-    previous_committed_topology_path_ = previous_topology_path;
+  // The guide only biases Hybrid A*. Commit its topology only after the
+  // accepted trajectory has passed the existing homotopy comparison.
+  if (!sameTopoPath(accepted_path, guide_prefix, 0.0, true)) {
+    ROS_WARN_THROTTLE(
+        1.0, "TCBS final trajectory differs from the proposed topology; "
+             "rejecting the pending guide path.");
+    return false;
   }
-  ++ects_counters_.commit_count;
-  ects_diagnostics_.active = std::to_string(committed_path->path_id);
-  checkSelectedInvariant("commitPendingGuideCandidate");
-  discardPendingGuideCandidate();
+
+  const bool had_current_topology = !last_best_path_.empty();
+  const bool topology_changed = had_current_topology &&
+      !sameTopoPath(guide, last_best_path_, 0.0, true);
+  const bool topology_reversed = topology_changed &&
+      !previous_committed_topology_.empty() &&
+      sameTopoPath(guide, previous_committed_topology_, 0.0, true);
+  const bool challenger_accepted =
+      pending_tcbs_decision_ == TCBSPendingDecision::INITIAL ||
+      pending_tcbs_decision_ == TCBSPendingDecision::SWITCH ||
+      pending_tcbs_decision_ == TCBSPendingDecision::FORCE_SWITCH;
+
+  if (had_current_topology) {
+    if (topology_changed) {
+      ++tcbs_statistics_.topology_switch_count;
+    } else {
+      ++tcbs_statistics_.topology_keep_count;
+    }
+  }
+  if (topology_reversed) {
+    ++tcbs_statistics_.topology_reversal_count;
+  }
+  if (challenger_accepted) {
+    ++tcbs_statistics_.challenger_accepted_count;
+  }
+  if (topology_changed) {
+    previous_committed_topology_ = last_best_path_;
+  }
+
+  last_best_path_ = guide;
+  auto commit_selected_flag = [&](vector<TopoPath>& container) {
+    for (TopoPath& path : container) {
+      path.selected = path.path_id == pending_path_id_;
+    }
+  };
+  commit_selected_flag(path_container_front_);
+  commit_selected_flag(path_container_back_);
+
+  ROS_DEBUG_STREAM("[TCBS] committed path_id=" << pending_path_id_);
+  ROS_DEBUG_STREAM("[TCBS] stats planning_cycles="
+                   << tcbs_statistics_.planning_cycle_count
+                   << " topology_switches="
+                   << tcbs_statistics_.topology_switch_count
+                   << " topology_keeps="
+                   << tcbs_statistics_.topology_keep_count
+                   << " topology_reversals="
+                   << tcbs_statistics_.topology_reversal_count
+                   << " invalid_keeps="
+                   << tcbs_statistics_.invalid_keep_count
+                   << " challengers_accepted="
+                   << tcbs_statistics_.challenger_accepted_count
+                   << " challengers_rejected_by_eta="
+                   << tcbs_statistics_.challenger_rejected_by_eta_count);
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
   return true;
 }
 
-void TopologyPRM::discardPendingGuideCandidate() {
-  pending_proposal_ = TopologySwitchProposal();
-  pending_guide_candidate_ = TopologyGuideCandidate();
+bool TopologyPRM::rejectPendingGuidePath() {
+  if (!risk_aware_path_selector_ ||
+      !risk_aware_path_selector_->getParameters().enable_tcbs ||
+      pending_path_id_ == 0) {
+    return false;
+  }
+
+  auto reject_pending = [&](vector<TopoPath>& container) {
+    for (TopoPath& path : container) {
+      if (path.path_id != pending_path_id_) continue;
+      path.safty = false;
+      path.state = TopoPath::INVALID;
+      path.tcbs_score.feasible = false;
+      path.selected = false;
+      return true;
+    }
+    return false;
+  };
+  const bool rejected = reject_pending(path_container_front_) ||
+                        reject_pending(path_container_back_);
+  if (rejected) {
+    ROS_DEBUG_STREAM("[TCBS] rejected downstream-infeasible path_id="
+                     << pending_path_id_);
+  }
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  return rejected;
 }
 
 void TopologyPRM::publishGuidePath(const std::vector<Eigen::Vector3d>& path_nodes)
@@ -2287,9 +2328,9 @@ void TopologyPRM::publishGuidePath(const std::vector<Eigen::Vector3d>& path_node
 }
 
 
-double TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const int& path_id,
-                                   const Eigen::Vector3d& start_state,
-                                   const double& radius)
+void TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const int& path_id,
+                                 const Eigen::Vector3d& start_state,
+                                 const double& radius)
 {
   // publishTestPath(path, 1);  
   dubins_shot_paths_[path_id].resize(0);
@@ -2297,9 +2338,8 @@ double TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const in
   int sample_num = 5;
   vector<Eigen::Vector3d> dis_path = discretizePath(path);
   vector<Eigen::Vector3d> dubins_path; 
-  DubinsPath::DubinsPath dubinsPath;
+  DubinsPath::DubinsPath dubinsPath;   
   double path_length_best = 10000;
-  double dubins_length_best = std::numeric_limits<double>::infinity();
   int i_best = 0;
   for(int i = sample_resolution; i < dis_path.size() && i <= sample_num * sample_resolution; i += sample_resolution)
   {
@@ -2309,7 +2349,7 @@ double TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const in
     double end_yaw = atan2(end_pt.y() - end_pt_pre.y(), end_pt.x() - end_pt_pre.x());
     double q0[] = { start_state(0), start_state(1), start_state(2) };
     double q1[] = { end_pt(0),   end_pt(1),   end_yaw };
-    if (dubins_init(q0, q1, radius, &dubinsPath) != EDUBOK) continue;
+    dubins_init(q0, q1, radius, &dubinsPath); 
     
     double x = resolution_;
     double move_step_size = resolution_;
@@ -2328,9 +2368,8 @@ double TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const in
       // } 
       dubins_path.emplace_back(path_pt);
     }
-    // publishTestPath(dubins_path, 2);
+    // publishTestPath(dubins_path, 2);    
     if(!isValid)  continue;
-    dubins_length_best = std::min(dubins_length_best, dubins_length);
     if(path_length < path_length_best)
     {
       path_length_best = path_length;
@@ -2351,9 +2390,6 @@ double TopologyPRM::findDubinsShot(const vector<Eigen::Vector3d>& path, const in
   }
   // publishTestPath(dubins_shot_paths_[path_id], 2);
   int debug = 0;
-  return dubins_shot_succ_[path_id]
-             ? dubins_length_best
-             : std::numeric_limits<double>::infinity();
 }
 
 // label = 0，全部， 1， front, 2，back
@@ -2684,25 +2720,12 @@ void TopologyPRM::checkPathObstacle3(const int& path_id, const bool& inFront)
     // dirty region. Keep it AFFECTED until selective HEC completes.
     onePath.state = TopoPath::AFFECTED;
     onePath.validated_map_revision = active_map_changes_.revision;
-    if (onePath.selected || onePath.path_id == invalid_active_path_id_) {
-      active_topology_invalid_ = false;
-      invalid_active_path_.clear();
-      invalid_active_path_id_ = 0;
-    }
     return;
   }
 
   // 存在碰撞
   onePath.safty = false;
   onePath.state = TopoPath::INVALID;
-  const bool is_active_topology = onePath.selected ||
-      (!last_best_path_.empty() &&
-       sameTopoPath(onePath.path, last_best_path_, 0.0, true));
-  if (is_active_topology) {
-    active_topology_invalid_ = true;
-    invalid_active_path_id_ = onePath.path_id;
-    invalid_active_path_ = onePath.path;
-  }
   ++invalidated_history_paths_;
 
   // 2) 向左回溯，找到左边界 L（最后一个 > dis_to_obs2 的点）
@@ -2749,8 +2772,6 @@ void TopologyPRM::reconnectTopoPaths()
     if(path_container_front_[i].safty) continue;
     if(path_container_front_[i].path_break.first.empty() || path_container_front_[i].path_break.second.empty())
     {
-      invalidateSelectedTopology(path_container_front_[i],
-                                 "collision has no reconnectable safe segments");
       // if(path_container_front_[i].path_break.first.empty()) 
       //   std::cout << "Will be erase beause 前面半段 is empty!\n";
       // else 
@@ -2767,8 +2788,6 @@ void TopologyPRM::reconnectTopoPaths()
     double connect_dis_square = (break_end - break_start).norm();
     if(connect_dis_square > 10)  // 大于10m，直接就不要了
     {
-      invalidateSelectedTopology(path_container_front_[i],
-                                 "reconnect span exceeds limit");
       // publishTestPath(path_container_front_[i].path_break.first, 1);
       // publishTestPath(path_container_front_[i].path_break.second, 2);
       std::cout << "Do not reconnet because the two break points' dis more than 10m." << std::endl;      
@@ -2792,19 +2811,11 @@ void TopologyPRM::reconnectTopoPaths()
   {
     if(path_container_back_[i].safty) continue;
     if(path_container_back_[i].path_break.first.empty() || path_container_back_[i].path_break.second.empty())
-    {
-      invalidateSelectedTopology(path_container_back_[i],
-                                 "collision has no reconnectable safe segments");
       continue;
-    }
     Eigen::Vector3d break_start = path_container_back_[i].path_break.first.back();
     Eigen::Vector3d break_end = path_container_back_[i].path_break.second.front();
     double connect_dis_square = (break_end - break_start).norm();
-    if(connect_dis_square > 10) {
-      invalidateSelectedTopology(path_container_back_[i],
-                                 "reconnect span exceeds limit");
-      continue; // 大于4m，直接就不要了
-    }
+    if(connect_dis_square > 10) continue; // 大于4m，直接就不要了
 
     // if(edt_environment_->evaluateCoarseEDT(break_start, -1, 1) <= 0.3 ||
     //    edt_environment_->evaluateCoarseEDT(break_end, -1, 1) <= 0.3)
@@ -2832,11 +2843,6 @@ void TopologyPRM::reconnectBreakPath(const int& path_id, const bool& inFront)
     vector<Eigen::Vector3d> connectPath = astar2D_path_finder_->getPath();
     onePath.safty = true;
     onePath.state = TopoPath::AFFECTED;
-    if (onePath.selected || onePath.path_id == invalid_active_path_id_) {
-      active_topology_invalid_ = false;
-      invalid_active_path_.clear();
-      invalid_active_path_id_ = 0;
-    }
     ++onePath.geometry_version;
     onePath.path.resize(0);
     onePath.path.insert(onePath.path.end(), onePath.path_break.first.begin(), onePath.path_break.first.end());
@@ -2849,7 +2855,6 @@ void TopologyPRM::reconnectBreakPath(const int& path_id, const bool& inFront)
     // ROS_WARN_STREAM("Path in " << (inFront ? "Front" : "Back") << " Success to Reconnect! Id: " << path_id << ".");
     int debug = 0;
   } else{
-    invalidateSelectedTopology(onePath, "collision reconnect failed");
     // ROS_WARN_STREAM("Path in " << (inFront ? "Front" : "Back") << " Failed to Reconnect! Id: " << path_id << ".");
     // publishTestPath(onePath.path_break.first, 1);
     // publishTestPath(onePath.path_break.second, 2);
@@ -2871,14 +2876,12 @@ void TopologyPRM::setStartChange(vector<Eigen::Vector3d>& start_change)
 
 void TopologyPRM::resetPathContainer()
 {
-  discardPendingGuideCandidate();
   last_best_path_.resize(0);
-  previous_committed_topology_path_.clear();
+  previous_committed_topology_.clear();
+  pending_path_id_ = 0;
+  pending_tcbs_decision_ = TCBSPendingDecision::NONE;
   path_container_back_.resize(0);
   path_container_front_.resize(0);
-  active_topology_invalid_ = false;
-  invalid_active_path_.clear();
-  invalid_active_path_id_ = 0;
   ROS_WARN("Reset Path Container because goal or start changed too much!");
 }
 
@@ -2888,27 +2891,12 @@ void TopologyPRM::updateAllPaths()
   // (2)short路径。【并行化有点问题】。
   //    检查剩下的路径是不是全部点都大于clearence_ = 0.3. 由于亚像素误差，实际取到的值为0.282843，不知道可能有什么问题
   // (3)重新计算path length,两个组重新排序。删除ratio太大的，近组远组都要删除，但是远组至少保留一个。
-  // (3.5) selected is the committed ACTIVE topology. Score/ranking,
-  // capacity and HEC pruning must not erase it. Collision detection preserves
-  // it during the reconnect attempt; a confirmed reconnect failure explicitly
-  // invalidates selected before this update removes the unusable path.
+  // (3.5)当前正在执行的这条一定要保留下来，除非其无效了【【【不一定非要把这个保留下来吧。先不保留】】】
   // 对于这个保留的逻辑。首先，在findDubinsShots时，在path_container里面选择，然后记录下path_id和inFront
   // findDubinsShots里完成【如果它是在远组，就将其放到近组里面去。如果近组不足5个，就放到后面，如果近组等于5个，就把近组最后一个替换】
   // findDubinsShots里完成【要将这个在远组的前面的路径给删除，用于确保近组->远组是非降序的】
   // (4)只检查近组的同伦。在后续正常采样时，也只和近组的相比较同伦，远组的不用。这里，我就对近组和远组进行了区分
   // (5)后面新添加的时候，也不能大于ratio_to_short
-  std::vector<uint64_t> protected_active_ids;
-  const auto remember_protected_active = [&protected_active_ids](
-                                             const vector<TopoPath>& paths) {
-    for (const auto& path : paths) {
-      if (path.selected && path.safty && path.state != TopoPath::INVALID) {
-        protected_active_ids.push_back(path.path_id);
-      }
-    }
-  };
-  remember_protected_active(path_container_front_);
-  remember_protected_active(path_container_back_);
-
   std::unordered_set<uint64_t> hec_dirty_path_ids;
   for (const auto& path : path_container_front_)
     if (path.state != TopoPath::VALID) hec_dirty_path_ids.insert(path.path_id);
@@ -2921,11 +2909,11 @@ void TopologyPRM::updateAllPaths()
 
   path_container_front_.erase(std::remove_if(path_container_front_.begin(), path_container_front_.end(),
                               [](const TopoPath& path){
-                                return !path.safty && !path.selected;
+                                return !path.safty;
                               }), path_container_front_.end());
   path_container_back_.erase(std::remove_if(path_container_back_.begin(), path_container_back_.end(),
                               [](const TopoPath& path){
-                                return !path.safty && !path.selected;
+                                return !path.safty;
                               }), path_container_back_.end());
   if(path_container_front_.empty()) path_container_front_.swap(path_container_back_);
 
@@ -2933,9 +2921,7 @@ void TopologyPRM::updateAllPaths()
   {
     if(!path_container_front_[i].safty) 
     {
-      ROS_DEBUG_STREAM_THROTTLE(
-          1.0, "[ECTS] retaining invalid committed ACTIVE path_id="
-               << path_container_front_[i].path_id << " for atomic handoff");
+      ROS_ERROR("Should not unsafty path appear here!");
       continue;
     }
 
@@ -2983,9 +2969,7 @@ void TopologyPRM::updateAllPaths()
   {
     if(!path_container_back_[i].safty) 
     {
-      ROS_DEBUG_STREAM_THROTTLE(
-          1.0, "[ECTS] retaining invalid committed ACTIVE path_id="
-               << path_container_back_[i].path_id << " for atomic handoff");
+      ROS_ERROR("Should not unsafty path appear here!");
       continue;
     }
     if(!start_change_.empty())
@@ -3016,6 +3000,33 @@ void TopologyPRM::updateAllPaths()
     int debug = 0;
   }
 
+  // Keep stored path costs on one candidate-set scale after geometry updates.
+  if (risk_aware_edge_) {
+    vector<RiskPathCost> costs;
+    costs.reserve(path_container_front_.size() + path_container_back_.size());
+    const auto append_costs = [&](const vector<TopoPath>& paths) {
+      for (const auto& path : paths) {
+        RiskPathCost cost;
+        cost.length = path.length;
+        cost.risk = path.risk;
+        cost.curvature_cost = path.curvature_cost;
+        for (const auto& edge : path.risk_edges)
+          cost.maximum_risk = std::max(cost.maximum_risk, edge.maximum_risk);
+        const auto& weights = risk_aware_edge_->getParameters();
+        cost.total_cost = weights.alpha * cost.length +
+                          weights.beta * cost.risk +
+                          weights.gamma * cost.curvature_cost;
+        costs.push_back(cost);
+      }
+    };
+    append_costs(path_container_front_);
+    append_costs(path_container_back_);
+    risk_aware_edge_->normalizeCandidateCosts(costs);
+    size_t index = 0;
+    for (auto& path : path_container_front_) path.total_cost = costs[index++].total_cost;
+    for (auto& path : path_container_back_) path.total_cost = costs[index++].total_cost;
+  }
+
   // 对两个组重新排序
   sort(path_container_front_.begin(), path_container_front_.end());
   sort(path_container_back_.begin(), path_container_back_.end());
@@ -3029,10 +3040,10 @@ void TopologyPRM::updateAllPaths()
   // if(path_container_front_.size() <)
   for(auto it = path_container_front_.begin(); it != path_container_front_.end(); )
   {
-    if(!it->selected && it->total_cost >= ratio_to_short_ * minCost)
+    if(it->total_cost >= ratio_to_short_ * minCost)
     {
       it = path_container_front_.erase(it);   
-      ROS_DEBUG_THROTTLE(2.0, "One uncommitted path in Front erased by ratio_to_short_");
+      ROS_WARN("One path in Front erased by ratio_to_short_");   
     }
     else ++it;
   }
@@ -3041,7 +3052,7 @@ void TopologyPRM::updateAllPaths()
     // 至少在path_container_back_保留一个
     for(auto it = path_container_back_.begin() + 1; it != path_container_back_.end(); )
     {
-      if(!it->selected && it->total_cost >= ratio_to_short_ * minCost)
+      if(it->total_cost >= ratio_to_short_ * minCost)
         it = path_container_back_.erase(it);
       else ++it;
     }
@@ -3051,11 +3062,6 @@ void TopologyPRM::updateAllPaths()
   {
     for(int j = i + 1; j < path_container_front_.size();)
     {
-      if (path_container_front_[i].selected ||
-          path_container_front_[j].selected) {
-        ++j;
-        continue;
-      }
       if (hec_dirty_path_ids.count(path_container_front_[i].path_id) == 0 &&
           hec_dirty_path_ids.count(path_container_front_[j].path_id) == 0) {
         ++j;
@@ -3073,11 +3079,6 @@ void TopologyPRM::updateAllPaths()
   {
     for(int j = i + 1; j < path_container_back_.size();)
     {
-      if (path_container_back_[i].selected ||
-          path_container_back_[j].selected) {
-        ++j;
-        continue;
-      }
       if (hec_dirty_path_ids.count(path_container_back_[i].path_id) == 0 &&
           hec_dirty_path_ids.count(path_container_back_[j].path_id) == 0) {
         ++j;
@@ -3095,11 +3096,6 @@ void TopologyPRM::updateAllPaths()
   // across them only when one side was affected in this cycle.
   for (int i = 0; i < path_container_front_.size(); ++i) {
     for (int j = 0; j < path_container_back_.size();) {
-      if (path_container_front_[i].selected ||
-          path_container_back_[j].selected) {
-        ++j;
-        continue;
-      }
       if (hec_dirty_path_ids.count(path_container_front_[i].path_id) == 0 &&
           hec_dirty_path_ids.count(path_container_back_[j].path_id) == 0) {
         ++j;
@@ -3114,45 +3110,25 @@ void TopologyPRM::updateAllPaths()
     }
   }
   for (auto& path : path_container_front_) {
-    if (path.safty) {
-      path.state = TopoPath::VALID;
-      path.validated_map_revision = active_map_changes_.revision;
-    }
+    path.state = TopoPath::VALID;
+    path.validated_map_revision = active_map_changes_.revision;
   }
   for (auto& path : path_container_back_) {
-    if (path.safty) {
-      path.state = TopoPath::VALID;
-      path.validated_map_revision = active_map_changes_.revision;
-    }
+    path.state = TopoPath::VALID;
+    path.validated_map_revision = active_map_changes_.revision;
   }
   logPathCosts();
-  const auto protected_still_selected = [this](uint64_t path_id) {
-    const auto selected_id_in = [path_id](const vector<TopoPath>& paths) {
-      return std::find_if(paths.begin(), paths.end(),
-                          [path_id](const TopoPath& path) {
-                            return path.path_id == path_id && path.selected;
-                          }) != paths.end();
-    };
-    return selected_id_in(path_container_front_) ||
-           selected_id_in(path_container_back_);
-  };
-  for (uint64_t path_id : protected_active_ids) {
-    if (!protected_still_selected(path_id)) {
-      ROS_ERROR_STREAM("[ECTS] committed ACTIVE path_id=" << path_id
-                       << " was lost during updateAllPaths");
-    }
-  }
-  checkSelectedInvariant("updateAllPaths");
   int debug = 0;
 }
 
 bool TopologyPRM::checkPathObstacle2(const std::vector<Eigen::Vector3d>& onePath)
 {
   // publishTestPath(onePath, 1);
+  if (onePath.size() < 2) return false;
 
   Eigen::Vector3d colli_pt;
   bool safty = true;
-  for(int i = 0; i < onePath.size() - 1; ++i)
+  for(size_t i = 0; i + 1 < onePath.size(); ++i)
   {
     if(!lineVisib(onePath[i], onePath[i + 1], clearance_, colli_pt, 0, -1))
     {

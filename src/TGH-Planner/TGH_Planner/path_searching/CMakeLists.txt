@@ -60,7 +60,9 @@ target_link_libraries( path_searching
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(path_reliability_evaluator_test
     test/path_reliability/PathReliabilityEvaluatorTest.cpp
-    test/path_reliability/PathReliabilityRankingTest.cpp)
+    test/path_reliability/PathReliabilityRankingTest.cpp
+    test/path_reliability/TCBSScoreTest.cpp
+    test/path_reliability/RiskAwareEdgeNormalizationTest.cpp)
   if(TARGET path_reliability_evaluator_test)
     target_link_libraries(path_reliability_evaluator_test
       path_searching

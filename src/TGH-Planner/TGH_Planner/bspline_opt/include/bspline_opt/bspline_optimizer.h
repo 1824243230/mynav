@@ -38,6 +38,7 @@
 // The format of points: N x 3 matrix, each row is a point
 namespace fast_planner {
 class BsplineOptimizer {
+  friend class BsplineOptimizerTestAccess;
 
 public:
   static const int SMOOTHNESS;   //平滑

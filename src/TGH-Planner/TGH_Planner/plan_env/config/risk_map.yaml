@@ -1,46 +1,92 @@
 risk_map:
   risk_enable: true
+
+  # d_safe = 1.2 * robot_width = 0.6 m
+  # distance risk at d_safe ≈ 1.5
   lambda_distance: 1.0
-  lambda_corridor: 1.0
-  lambda_unknown: 1.0
+
+  # safe corridor width = 2 * robot_width = 1.0 m
+  # corridor risk at w_safe ≈ 2.0
+  lambda_corridor: 0.5
+
+  # unknown-region additional penalty
+  lambda_unknown: 0.5
+
   robot_width: 0.5
 
+
 risk_aware_graph:
+
+  # Length and risk use candidate maxima; gamma weights raw dimensionless AVC.
+
   alpha: 1.0
-  beta: 1.0
-  # gamma=0 keeps J(path)=alpha*L+beta*R exactly; increase it to penalize turns.
-  gamma: 0.0
+  beta: 0.40
+  gamma: 0.50
+  # AVC-inspired feasibility penalty uses these positive vehicle values.
+  nominal_speed: 1.0
+  min_turn_radius: 1.0
+
   edge_sample_resolution: 0.1
+  # Fine sampling defaults to the previous edge_sample_resolution value.
+  fine_resolution: 0.1
+  coarse_resolution: 1.0
+  top_k_path: 10
+  # Candidate-set maximum normalization; also protects zero maxima.
+  normalization_epsilon: 1.0e-9
+  # CVaR uses the highest-risk 10% of samples on each edge.
+  risk_cvar_ratio: 0.1
+  risk_cvar_weight: 1.0
+  # Effectively disabled by default; set a finite operating limit as needed.
+  risk_threshold: 1.0e+100
+  # Same scale as the selector's high-risk boundary below.
+  risk_safe_threshold: 150.0
+
 
 risk_aware_path_selector:
-  # Cost = w1 * normalized_length - w2 * normalized_risk (larger is better).
+
+  # TCBS is opt-in; disabled preserves the legacy path selector.
+  enable_tcbs: false
+  eta_switch: 0.15
+  switch_threshold: 0.1
+  lambda_switch: 0.1
+
+  # normalized score:
+  # length : risk = 1 : 2
   w1: 1.0
-  w2: 1.0
-  high_risk_threshold: 5.0
+  w2: 1.5
+
+  # Theoretical high-risk boundary
+  high_risk_threshold: 15.0
+
+  # 4 * robot_width
   open_space_width_threshold: 2.0
-  dynamic_weight_gain: 0.0
-  orientation_tie_threshold: 0.01
+  # moderate adaptive weighting
+  dynamic_weight_gain: 0.2
+
+  orientation_tie_threshold: 0.03
+
   sample_resolution: 0.1
 
-ects:
-  enabled: true
-  use_fixed_scale_score: true
-  length_ref: 1.0
-  risk_ref: 1.0
-  prs_ref: 1.0
-  lambda_switch: 1.0
-  switch_margin: 0.0
-  dubins_ref: 1.0
 
-# Path Reliability Score evaluator and final candidate-ranking weights.
 path_reliability:
   enable: true
-  lambda_length: 1.0
+
+  # Final ranking
+  lambda_length: 2.0
   lambda_risk: 1.0
-  lambda_prs: 1.0
-  alpha: 1.0
-  beta: 1.0
-  gamma: 1.0
+  lambda_prs: 0.5
+
+  # exp(-alpha * 5) ≈ 0.5
+  alpha: 0.14
+
+  # assuming clearance_risk normalized to [0,1]
+  beta: 0.69
+
+  # assuming risk_variance critical value ≈ 4
+  gamma: 0.17
+
   epsilon: 0.001
+
   sample_resolution: 0.1
+
   debug_output: true

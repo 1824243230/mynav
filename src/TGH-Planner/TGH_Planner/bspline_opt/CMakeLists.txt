@@ -57,3 +57,10 @@ target_link_libraries(nlopt_test
     /usr/local/lib/libnlopt.so
     # glog::glog
     )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(bspline_navigation_test test/bspline_navigation_test.cpp)
+  if(TARGET bspline_navigation_test)
+    target_link_libraries(bspline_navigation_test bspline_opt ${catkin_LIBRARIES})
+  endif()
+endif()

@@ -25,6 +25,8 @@
 
 #include "bspline_opt/bspline_optimizer.h"
 #include <nlopt.hpp>
+#include <algorithm>
+#include <cmath>
 // #include <glog/logging.h>
 
 // #define LOG_INFO
@@ -272,6 +274,14 @@ void BsplineOptimizer::optimize() {
     }
   }
 
+  // Each solve needs its own safe fallback; never reuse a previous trajectory's
+  // best variables if NLopt fails before evaluating the objective.
+  if (!std::all_of(q.begin(), q.end(), [](double value) { return std::isfinite(value); })) {
+    ROS_WARN_THROTTLE(1.0, "[Optimization]: non-finite initial control point");
+    return;
+  }
+  best_variable_ = q;
+
   //设置变量的上下界
   if (dim_ != 1) {
     vector<double> lb(variable_num_), ub(variable_num_);
@@ -298,12 +308,19 @@ void BsplineOptimizer::optimize() {
     if(cost_function_ & FEASIBILITYYaw) flag_out_ = 1;
   } 
   catch (nlopt::forced_stop &e) {
-    ROS_WARN("[Optimization]: stopped after cost tolerances were met");
-    cout << e.what() << endl;
+    ROS_DEBUG_STREAM("[Optimization]: stopped after cost tolerances were met: " << e.what());
   }  
   catch (std::exception& e) {
-    ROS_WARN("[Optimization]: nlopt exception");
-    cout << e.what() << endl;
+    ROS_WARN_STREAM_THROTTLE(1.0, "[Optimization]: NLopt failed; using best finite iterate"
+                             << " (cost_function=" << cost_function_ << ", iterations=" << iter_num_
+                             << ", variables=" << variable_num_ << "): " << e.what());
+  }
+
+  if (best_variable_.size() != static_cast<size_t>(variable_num_) ||
+      !std::all_of(best_variable_.begin(), best_variable_.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    ROS_WARN_THROTTLE(1.0, "[Optimization]: no finite solution; retaining input control points");
+    return;
   }
 
   for (int i = fix_num_start_; i < control_points_.rows(); ++i) {
@@ -789,8 +806,11 @@ void BsplineOptimizer::calcCtrlPtYawCost(const vector<Eigen::Vector3d>& q, doubl
   vector<double> cost_tmp(gradient.size(), 0.0);
   vector<Eigen::Vector3d> gradient_tmp(gradient.size(), Eigen::Vector3d::Zero());
 
-  static const double  ts      = bspline_interval_;
-  static const double  ts_inv2 = 1.0 / ts / ts;
+  constexpr double kVectorEpsilon = 1e-8;
+  constexpr double kCosineEpsilon = 1e-8;
+  if (!std::isfinite(bspline_interval_) || bspline_interval_ <= 0.0 ||
+      !std::isfinite(min_r_) || min_r_ <= 0.0) return;
+  const double ts_inv2 = 1.0 / bspline_interval_ / bspline_interval_;
   static const vector<int> idx{0, 1, 2};
   // 前3个不动
   // 使用前向差分来计算当前点的角速度.计算的是当前i的！！
@@ -801,15 +821,23 @@ void BsplineOptimizer::calcCtrlPtYawCost(const vector<Eigen::Vector3d>& q, doubl
     vA = q.at(i + 1) - q.at(i + 0);  //前一个vec
     vB = q.at(i + 2) - q.at(i + 1);
     // theta1 - theta0的值大小就是两个向量的夹角，然后再通过旋转方向来判断正负
-    m = (vA.dot(vB) / (vB.norm() * vA.norm()));
+    vAnorm = vA.norm();
+    vBnorm = vB.norm();
+    if (!std::isfinite(vAnorm) || !std::isfinite(vBnorm) ||
+        vAnorm <= kVectorEpsilon || vBnorm <= kVectorEpsilon) continue;
+    m = vA.dot(vB) / (vAnorm * vBnorm);
+    if (!std::isfinite(m)) continue;
+    // A nearly straight segment has zero turning penalty; acos' derivative
+    // is singular at +/-1, so keep the other case inside its finite domain.
+    if (m >= 1.0 - kCosineEpsilon) continue;
+    m = std::max(-1.0 + kCosineEpsilon, std::min(1.0 - kCosineEpsilon, m));
     acos_m = std::acos(m);
-    mm = -2 * acos_m / (sqrt(1 - m * m));
+    mm = -2 * acos_m / std::sqrt(1.0 - m * m);
     
     constraint = vA.squaredNorm();
     if(acos_m * acos_m > constraint / min_r_ / min_r_)
     {
       cost_tmp[i] = ts_inv2 * (acos_m * acos_m - constraint / min_r_ / min_r_);
-      vAnorm = vA.norm(); vBnorm = vB.norm();
       vABnorm = vAnorm * vBnorm;
       for(int j = 0; j < idx.size(); ++j)
       {
@@ -817,22 +845,22 @@ void BsplineOptimizer::calcCtrlPtYawCost(const vector<Eigen::Vector3d>& q, doubl
         {
         case 0:
         {
-          gradient_tmp[i + idx[j]] = ts_inv2 * ((mm * 
+          gradient_tmp[i + idx[j]] += ts_inv2 * ((mm *
                                      (-vB * vABnorm + vA * vBnorm / vAnorm * (vA.dot(vB))) / vABnorm / vABnorm)
                                       + 2 * vA / min_r_ / min_r_);
           break;
         }
         case 1:
         {
-          gradient_tmp[i + idx[j]] = ts_inv2 * ((mm * 
+          gradient_tmp[i + idx[j]] += ts_inv2 * ((mm *
                                      ((vB - vA) * vABnorm - (vA * vBnorm / vAnorm - vB * vAnorm / vBnorm) * (vA.dot(vB))) / vABnorm / vABnorm)
                                       - 2 * vA / min_r_ / min_r_);
           break;
         }          
         case 2:
         {
-          gradient_tmp[i + idx[j]] = ts_inv2 * ((mm * 
-                                     (vA * vABnorm + vB * vAnorm / vBnorm * (vA.dot(vB))) / vABnorm / vABnorm)
+          gradient_tmp[i + idx[j]] += ts_inv2 * ((mm *
+                                     (vA * vABnorm - vB * vAnorm / vBnorm * (vA.dot(vB))) / vABnorm / vABnorm)
                                       );
           break;
         }       

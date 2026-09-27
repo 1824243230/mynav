@@ -25,42 +25,41 @@
 
 
 #include <plan_manage/kino_replan_fsm.h>
+#include <stdexcept>
 
 namespace fast_planner {
 
 void KinoReplanFSM::init(ros::NodeHandle& nh) {
-  trigger_ = false;
+  current_wp_  = 0;
+  exec_state_  = FSM_EXEC_STATE::INIT;
+  trigger_     = false;
   have_target_ = false;
-  have_odom_ = false;
-  planning_busy_ = false;
-  replan_pending_ = false;
-  active_trajectory_unsafe_ = false;
-  topology_reset_pending_ = false;
+  have_odom_   = false;
   last_plan_time_ = 0.0;
-  last_planning_attempt_wall_time_ = ros::WallTime(0);
-  current_wp_ = 0;
-  exec_state_ = FSM_EXEC_STATE::INIT;
-  odom_pos_.setZero();
-  odom_vel_.setZero();
-  odom_orient_.setIdentity();
-  start_pt_.setZero();
-  start_vel_.setZero();
-  start_acc_.setZero();
-  start_yaw_.setZero();
-  end_pt_.setZero();
-  end_vel_.setZero();
-  end_yaw_.setZero();
 
   /*  fsm param  */
   nh.param("fsm/flight_type", target_type_, -1);
   nh.param("fsm/thresh_replan", replan_thresh_, -1.0);      //
   nh.param("fsm/thresh_no_replan", no_replan_thresh_, -1.0);//
-  nh.param("fsm/planning_retry_interval", planning_retry_interval_, 0.5);
-  planning_retry_interval_ = std::max(0.05, planning_retry_interval_);
 
   nh.param("fsm/waypoint_num", waypoint_num_, -1);
-  waypoint_num_ = std::max(0, std::min(50, waypoint_num_));
+  if (waypoint_num_ < 0 || waypoint_num_ > 50) {
+    ROS_WARN("Invalid waypoint count %d; preset goals are disabled.", waypoint_num_);
+    waypoint_num_ = 0;
+  }
   nh.param("fsm/B_Spline_LocalPlanner", use_kino_replan_, true);
+  bool use_topo_path = false;
+  bool use_kinodynamic_path = false;
+  bool use_optimization = false;
+  nh.param("manager/use_topo_path", use_topo_path, false);
+  nh.param("manager/use_kinodynamic_path", use_kinodynamic_path, false);
+  nh.param("manager/use_optimization", use_optimization, false);
+  if (!use_topo_path ||
+      (use_kino_replan_ && (!use_kinodynamic_path || !use_optimization))) {
+    ROS_FATAL("Kino planner requires topology; B-spline mode also requires "
+              "kinodynamic search and optimization modules.");
+    throw std::runtime_error("Invalid Kino planner module configuration");
+  }
   for (int i = 0; i < waypoint_num_; i++) {
     nh.param("fsm/waypoint" + to_string(i) + "_x", waypoints_[i][0], -1.0);
     nh.param("fsm/waypoint" + to_string(i) + "_y", waypoints_[i][1], -1.0);
@@ -91,14 +90,22 @@ void KinoReplanFSM::init(ros::NodeHandle& nh) {
 }
 
 void KinoReplanFSM::waypointCallback(const nav_msgs::PathConstPtr& msg) {
-  if (msg->poses.empty()) {
-    ROS_WARN("Ignore empty waypoint message.");
+  if (!msg || msg->poses.empty()) {
+    ROS_WARN_THROTTLE(1.0, "Ignore empty waypoint path.");
     return;
   }
   if (msg->poses[0].pose.position.z < -0.1) return;
+  if (target_type_ != TARGET_TYPE::MANUAL_TARGET &&
+      target_type_ != TARGET_TYPE::PRESET_TARGET) {
+    ROS_ERROR_THROTTLE(1.0, "Unsupported Kino target type: %d", target_type_);
+    return;
+  }
+  if (target_type_ == TARGET_TYPE::PRESET_TARGET && waypoint_num_ == 0) {
+    ROS_ERROR_THROTTLE(1.0, "Preset target has no valid waypoints.");
+    return;
+  }
 
   cout << "Triggered!" << endl;
-  trigger_ = true;
 
   // 将终点存起来
   if (target_type_ == TARGET_TYPE::MANUAL_TARGET) {
@@ -108,10 +115,6 @@ void KinoReplanFSM::waypointCallback(const nav_msgs::PathConstPtr& msg) {
   } 
   //相当于这里，即使设置了一系列waypoints，但是终点的切换还是手动完成的
   else if (target_type_ == TARGET_TYPE::PRESET_TARGET) {
-    if (waypoint_num_ == 0) {
-      ROS_ERROR("Preset target requested without configured waypoints.");
-      return;
-    }
     end_pt_(0)  = waypoints_[current_wp_][0];
     end_pt_(1)  = waypoints_[current_wp_][1];
     end_pt_(2)  = waypoints_[current_wp_][2];
@@ -120,13 +123,7 @@ void KinoReplanFSM::waypointCallback(const nav_msgs::PathConstPtr& msg) {
   visualization_->drawGoal(end_pt_, 0.3, Eigen::Vector4d(1, 0, 0, 1.0));
   end_vel_.setZero();
   have_target_ = true;
-
-  if (planning_busy_) {
-    replan_pending_ = true;
-    topology_reset_pending_ = true;
-    ROS_INFO("Planner busy; coalesced waypoint replan request.");
-    return;
-  }
+  trigger_ = true;
 
   planner_manager_->resetTopoPathContainer();
   if (exec_state_ == WAIT_TARGET)
@@ -165,104 +162,6 @@ void KinoReplanFSM::printFSMExecState() {
   cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
 }
 
-bool KinoReplanFSM::planningRetryReady() const {
-  if (last_planning_attempt_wall_time_.toSec() <= 0.0) return true;
-  return (ros::WallTime::now() - last_planning_attempt_wall_time_).toSec() >=
-         planning_retry_interval_;
-}
-
-bool KinoReplanFSM::pendingReplanStillRequired() const {
-  if (!have_target_ || !have_odom_) return false;
-  if (active_trajectory_unsafe_ || !planner_manager_->hasActivePlan()) {
-    return true;
-  }
-
-  NonUniformBspline active_position =
-      planner_manager_->local_data_.position_traj_;
-  const double duration = active_position.getTimeSum();
-  if (duration <= 0.0) return true;
-  const Eigen::Vector3d active_end =
-      active_position.evaluateDeBoorT(duration);
-  return (active_end - end_pt_).norm() >
-         std::max(0.1, no_replan_thresh_);
-}
-
-void KinoReplanFSM::requestReplan(bool emergency_stop,
-                                  const string& source) {
-  if (!have_target_) return;
-
-  if (emergency_stop) {
-    const bool first_invalidation = !active_trajectory_unsafe_;
-    active_trajectory_unsafe_ = true;
-    if (first_invalidation && planner_manager_->hasActivePlan()) {
-      // This is the only normal producer of /planning/replan in Kino FSM.
-      // traj_server may truncate the old trajectory because it is confirmed
-      // unsafe, not merely because a replacement is being attempted.
-      replan_pub_.publish(std_msgs::Empty());
-      ROS_ERROR("Emergency stop: invalidating unsafe ActivePlan.");
-    }
-  }
-
-  if (planning_busy_) {
-    replan_pending_ = true;
-    ROS_INFO_STREAM("Planner busy; coalesced replan request from " << source);
-    return;
-  }
-
-  const FSM_EXEC_STATE next_state =
-      (!planner_manager_->hasActivePlan() || active_trajectory_unsafe_)
-          ? GEN_NEW_TRAJ
-          : REPLAN_TRAJ;
-  if (exec_state_ != next_state) changeFSMExecState(next_state, source);
-}
-
-bool KinoReplanFSM::tryPlanningAttempt(bool& success) {
-  if (planning_busy_) {
-    replan_pending_ = true;
-    return false;
-  }
-  if (!planningRetryReady()) return false;
-
-  planning_busy_ = true;
-  last_planning_attempt_wall_time_ = ros::WallTime::now();
-  success = callKinodynamicReplan();
-  planning_busy_ = false;
-  return true;
-}
-
-void KinoReplanFSM::finishPlanningAttempt(bool success,
-                                          bool initial_attempt) {
-  if (success) {
-    active_trajectory_unsafe_ = false;
-    last_plan_time_ = 0.0;
-    changeFSMExecState(EXEC_TRAJ, "FSM");
-  } else if (initial_attempt || active_trajectory_unsafe_ ||
-             !planner_manager_->hasActivePlan()) {
-    changeFSMExecState(GEN_NEW_TRAJ, "FSM");
-  } else {
-    ROS_WARN("CandidatePlan failed; continuing the current ActivePlan.");
-    changeFSMExecState(EXEC_TRAJ, "FSM");
-  }
-
-  if (!replan_pending_) return;
-
-  replan_pending_ = false;
-  const bool retry_required = pendingReplanStillRequired();
-  if (retry_required) {
-    if (topology_reset_pending_) planner_manager_->resetTopoPathContainer();
-    topology_reset_pending_ = false;
-    const FSM_EXEC_STATE next_state =
-        (!planner_manager_->hasActivePlan() || active_trajectory_unsafe_)
-            ? GEN_NEW_TRAJ
-            : REPLAN_TRAJ;
-    changeFSMExecState(next_state, "PENDING");
-    ROS_INFO("Scheduling one coalesced pending replan attempt.");
-  } else {
-    topology_reset_pending_ = false;
-    ROS_INFO("Dropping stale pending replan request.");
-  }
-}
-
 void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
   static int fsm_num = 0;
   fsm_num++;
@@ -295,7 +194,6 @@ void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
     }
 
     case GEN_NEW_TRAJ: {
-      if (planning_busy_ || !planningRetryReady()) return;
       start_pt_  = odom_pos_;
       start_vel_ = odom_vel_;
       start_acc_.setZero();
@@ -304,9 +202,15 @@ void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
       start_yaw_(0)         = atan2(rot_x(1), rot_x(0));
       start_yaw_(1) = start_yaw_(2) = 0.0;
 
-      bool success = false;
-      if (!tryPlanningAttempt(success)) return;
-      finishPlanningAttempt(success, true);
+      bool success = callKinodynamicReplan();
+      if (success) {
+        last_plan_time_ = 0.0;
+        changeFSMExecState(EXEC_TRAJ, "FSM");
+      } else {
+        // have_target_ = false;
+        // changeFSMExecState(WAIT_TARGET, "FSM");
+        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+      }
       break;
     }
 
@@ -358,11 +262,9 @@ void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
     }
 
     case REPLAN_TRAJ: {
-      if (planning_busy_ || !planningRetryReady()) return;
       LocalTrajData* info     = &planner_manager_->local_data_;
       ros::Time      time_now = ros::Time::now();
       double         t_cur    = (time_now - info->start_time_).toSec();
-      t_cur = std::max(0.0, std::min(info->duration_, t_cur));
 
       if(planner_manager_->only2D())
       {
@@ -387,20 +289,32 @@ void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
         start_yaw_(2) = info->yawdotdot_traj_.evaluateDeBoorT(t_cur)[0];        
       }
 
-      bool success = false;
-      if (!tryPlanningAttempt(success)) return;
-      finishPlanningAttempt(success, false);
+
+      std_msgs::Empty replan_msg;
+      replan_pub_.publish(replan_msg);
+
+      bool success = callKinodynamicReplan();
+      if (success) {
+        last_plan_time_ = 0.0;
+        changeFSMExecState(EXEC_TRAJ, "FSM");
+      } else {
+        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+      }
       break;
     }
-    case REPLAN_NEW:
-      changeFSMExecState(REPLAN_TRAJ, "FSM");
+    case REPLAN_NEW: {
+      // This legacy state has no distinct planning path in the kino FSM.
+      // Recover through the normal new-trajectory state instead of indexing
+      // state tables or leaving the state machine stalled.
+      changeFSMExecState(GEN_NEW_TRAJ, "FSM");
       break;
+    }
   }
 }
 
 void KinoReplanFSM::odomRecordCallback(const ros::TimerEvent& e)
 {
-  if(!have_odom_ || planning_busy_) return;
+  if(!have_odom_) return;
   // 这个只能是-0.5，和topo路径搜索时的z轴一致
   Eigen::Vector3d odom_pos(odom_pos_.x(), odom_pos_.y(), -0.5);
   if(start_change_.empty())
@@ -411,7 +325,6 @@ void KinoReplanFSM::odomRecordCallback(const ros::TimerEvent& e)
 
 void KinoReplanFSM::TopoContainerUpdate(const ros::TimerEvent& e)
 {
-  if (planning_busy_) return;
   // ROS_WARN("Update TopoPath Container!");
   planner_manager_->topoUpdate(start_change_);
   start_change_.resize(0);
@@ -438,6 +351,7 @@ void KinoReplanFSM::checkCollisionCallback(const ros::TimerEvent& e) {
     //当前的end_pt_！发生了碰撞，那么就在终点附近重新找一个最好的无碰撞的end_pt_
     if (dist <= 0.3) {
       /* try to find a max distance goal around */
+      bool            new_goal = false;
       const double    dr = 0.5, dtheta = 30, dz = 0.3;
       double          new_x, new_y, new_z, max_dist = -1.0;
       Eigen::Vector3d goal;
@@ -472,7 +386,9 @@ void KinoReplanFSM::checkCollisionCallback(const ros::TimerEvent& e) {
         have_target_ = true;
         end_vel_.setZero();
 
-        requestReplan(false, "SAFETY_GOAL");
+        if (exec_state_ == EXEC_TRAJ) {
+          changeFSMExecState(REPLAN_TRAJ, "SAFETY");
+        }
 
         visualization_->drawGoal(end_pt_, 0.3, Eigen::Vector4d(1, 0, 0, 1.0));
       } else {
@@ -480,7 +396,10 @@ void KinoReplanFSM::checkCollisionCallback(const ros::TimerEvent& e) {
         // cout << "Goal near collision, stop." << endl;
         // changeFSMExecState(WAIT_TARGET, "SAFETY");
         cout << "goal near collision, keep retry" << endl;
-        requestReplan(false, "SAFETY_GOAL");
+        changeFSMExecState(REPLAN_TRAJ, "FSM");
+
+        std_msgs::Empty emt;
+        replan_pub_.publish(emt);
       }
     }
   }
@@ -488,16 +407,14 @@ void KinoReplanFSM::checkCollisionCallback(const ros::TimerEvent& e) {
   /* ---------- check trajectory ---------- */
   // 如果是轨迹发生了碰撞，那么就立即重新规划一条轨迹
   // 如果use_kino_replan_为false，说明用的是cmu_planner，这个planner不检查轨迹碰撞
-  if ((exec_state_ == FSM_EXEC_STATE::EXEC_TRAJ ||
-       (planning_busy_ && planner_manager_->hasActivePlan())) &&
-      use_kino_replan_) {
+  if (exec_state_ == FSM_EXEC_STATE::EXEC_TRAJ && use_kino_replan_) {
     double dist;
     bool   safe = planner_manager_->checkTrajCollision(dist);
 
     if (!safe) {
       // cout << "current traj in collision." << endl;
       ROS_WARN("current traj in collision.");
-      requestReplan(true, "SAFETY_TRAJECTORY");
+      changeFSMExecState(REPLAN_TRAJ, "SAFETY");
     }
   }
 }
@@ -509,8 +426,6 @@ bool KinoReplanFSM::callKinodynamicReplan() {
   planner_manager_->TopoPathReplan(start_pt_, end_pt_, start_yaw_, start_change_);
   if (!use_kino_replan_)
   {
-    planner_manager_->discardCandidatePlan();
-    ROS_WARN("CandidatePlan was not generated because kinodynamic replanning is disabled.");
     auto plan_data = &planner_manager_->plan_data_;
     visualization_->drawGuidePath(plan_data->topo_guide_path_, 0.075, Eigen::Vector4d(0.5, 0.5, 0.0, 1.0));
     visualization_->drawTopoGraph(plan_data->topo_graph_, 0.2, 0.05, Eigen::Vector4d(1.0, 0, 0.0, 1.0), 
@@ -532,17 +447,32 @@ bool KinoReplanFSM::callKinodynamicReplan() {
     //   waypoint_pub_.publish(wp_msg);    
     // }
 
+    if (!planner_manager_->commitTopoGuidePath(plan_data->topo_guide_path_)) {
+      planner_manager_->rejectPendingTopoPath();
+      return false;
+    }
     ROS_DEBUG_STREAM("[IncrementalTopo] total_replanning_time="
                      << (ros::WallTime::now() - replanning_begin).toSec() * 1000.0 << "ms");
-    return false;
+    return true;
   }
 
 
-  bool plan_success =
-      planner_manager_->kinodynamicReplan(start_pt_, start_vel_, start_acc_, end_pt_, end_vel_, start_yaw_, end_yaw_, start_change_);
+  bool plan_success = planner_manager_->kinodynamicReplan(
+      start_pt_, start_vel_, start_acc_, end_pt_, end_vel_, start_yaw_, end_yaw_, start_change_);
+  while (!plan_success && planner_manager_->rejectPendingTopoPath() &&
+         planner_manager_->selectNextTopoGuidePath(start_pt_, start_yaw_)) {
+    // Retry another feasible TCBS candidate from this cycle. Each failed
+    // proposal is excluded, so the loop terminates when candidates run out.
+    plan_success = planner_manager_->kinodynamicReplan(
+        start_pt_, start_vel_, start_acc_, end_pt_, end_vel_, start_yaw_, end_yaw_, start_change_);
+  }
   start_change_.resize(0);
-  if (plan_success &&
-      planner_manager_->commitCandidatePlan(start_yaw_, end_yaw_)) {
+  if (!plan_success) {
+    planner_manager_->rejectPendingTopoPath();
+  }
+  if (plan_success) {
+
+    planner_manager_->planYaw(start_yaw_, end_yaw_);
 
     auto info = &planner_manager_->local_data_;
 
@@ -605,7 +535,6 @@ bool KinoReplanFSM::callKinodynamicReplan() {
     return true;
 
   } else {
-    planner_manager_->rejectCandidatePlan();
     cout << "generate new traj fail." << endl;
     ROS_DEBUG_STREAM("[IncrementalTopo] total_replanning_time="
                      << (ros::WallTime::now() - replanning_begin).toSec() * 1000.0 << "ms");
@@ -615,12 +544,6 @@ bool KinoReplanFSM::callKinodynamicReplan() {
 
 bool KinoReplanFSM::reset_env(common_srvs::reset_env::Request &req, common_srvs::reset_env::Response &res)
 {
-  if (planning_busy_) {
-    ROS_WARN("Reject reset_env while planner is busy.");
-    replan_pending_ = true;
-    res.success = false;
-    return true;
-  }
   ROS_WARN("Receive Service Call!");
   this->planner_manager_->edt_environment_->sdf_map_->resetBuffer();
   std_msgs::Empty emt;

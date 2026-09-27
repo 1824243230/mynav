@@ -40,6 +40,14 @@ void RiskAwarePathSelector::init(ros::NodeHandle& nh,
            params_.orientation_tie_threshold, params_.orientation_tie_threshold);
   nh.param("risk_aware_path_selector/sample_resolution",
            params_.sample_resolution, params_.sample_resolution);
+  nh.param("risk_aware_path_selector/enable_tcbs", params_.enable_tcbs,
+           params_.enable_tcbs);
+  nh.param("risk_aware_path_selector/eta_switch", params_.eta_switch,
+           params_.eta_switch);
+  nh.param("risk_aware_path_selector/switch_threshold", params_.switch_threshold,
+           params_.switch_threshold);
+  nh.param("risk_aware_path_selector/lambda_switch", params_.lambda_switch,
+           params_.lambda_switch);
   nh.param("path_reliability/enable", params_.reliability_enabled,
            params_.reliability_enabled);
   nh.param("path_reliability/lambda_length", params_.lambda_length,
@@ -48,15 +56,6 @@ void RiskAwarePathSelector::init(ros::NodeHandle& nh,
            params_.lambda_risk);
   nh.param("path_reliability/lambda_prs", params_.lambda_prs,
            params_.lambda_prs);
-  nh.param("ects/enabled", params_.ects_enabled, params_.ects_enabled);
-  nh.param("ects/use_fixed_scale_score", params_.use_fixed_scale_score,
-           params_.use_fixed_scale_score);
-  nh.param("ects/length_ref", params_.length_ref, params_.length_ref);
-  nh.param("ects/risk_ref", params_.risk_ref, params_.risk_ref);
-  nh.param("ects/prs_ref", params_.prs_ref, params_.prs_ref);
-  nh.param("ects/lambda_switch", params_.lambda_switch, params_.lambda_switch);
-  nh.param("ects/switch_margin", params_.switch_margin, params_.switch_margin);
-  nh.param("ects/dubins_ref", params_.dubins_ref, params_.dubins_ref);
 
   params_ = sanitizeParameters(params_, map_resolution_);
 
@@ -65,19 +64,15 @@ void RiskAwarePathSelector::init(ros::NodeHandle& nh,
                   << ", high_risk_threshold=" << params_.high_risk_threshold
                   << ", open_space_width_threshold="
                   << params_.open_space_width_threshold
+                  << ", enable_tcbs=" << std::boolalpha << params_.enable_tcbs
+                  << ", eta_switch=" << params_.eta_switch
+                  << ", switch_threshold=" << params_.switch_threshold
+                  << ", lambda_switch=" << params_.lambda_switch
                   << ", reliability_enabled=" << std::boolalpha
                   << params_.reliability_enabled
                   << ", lambda_length=" << params_.lambda_length
                   << ", lambda_risk=" << params_.lambda_risk
-                  << ", lambda_prs=" << params_.lambda_prs
-                  << ", ects_enabled=" << params_.ects_enabled
-                  << ", fixed_scale_score=" << params_.use_fixed_scale_score
-                  << ", length_ref=" << params_.length_ref
-                  << ", risk_ref=" << params_.risk_ref
-                  << ", prs_ref=" << params_.prs_ref
-                  << ", lambda_switch=" << params_.lambda_switch
-                  << ", switch_margin=" << params_.switch_margin
-                  << ", dubins_ref=" << params_.dubins_ref);
+                  << ", lambda_prs=" << params_.lambda_prs);
 }
 
 PathSelectionResult RiskAwarePathSelector::selectBestPath(
@@ -96,16 +91,15 @@ PathSelectionResult RiskAwarePathSelector::selectBestPath(
   std::size_t valid_risk_count = 0;
 
   for (const auto& candidate : candidates) {
-    if (std::isfinite(candidate.length)) {
-      min_length = std::min(min_length, candidate.length);
-      max_length = std::max(max_length, candidate.length);
+    if (!std::isfinite(candidate.risk) || !std::isfinite(candidate.length)) {
+      continue;
     }
-    if (std::isfinite(candidate.risk)) {
-      min_risk = std::min(min_risk, candidate.risk);
-      max_risk = std::max(max_risk, candidate.risk);
-      risk_sum += candidate.risk;
-      ++valid_risk_count;
-    }
+    min_length = std::min(min_length, candidate.length);
+    max_length = std::max(max_length, candidate.length);
+    min_risk = std::min(min_risk, candidate.risk);
+    max_risk = std::max(max_risk, candidate.risk);
+    risk_sum += candidate.risk;
+    ++valid_risk_count;
   }
 
   if (!std::isfinite(min_length)) {
@@ -129,101 +123,167 @@ PathSelectionResult RiskAwarePathSelector::selectBestPath(
   result.lambda_length = params_.lambda_length;
   result.lambda_risk = params_.lambda_risk;
   result.lambda_prs = params_.lambda_prs;
-  result.fixed_scale_score = params_.ects_enabled && params_.use_fixed_scale_score;
-  result.candidate_scores.reserve(candidates.size());
 
   for (std::size_t i = 0; i < candidates.size(); ++i) {
     const auto& candidate = candidates[i];
+    if (!std::isfinite(candidate.risk) || !std::isfinite(candidate.length)) {
+      continue;
+    }
+    const double length_score =
+        1.0 - normalizedValue(candidate.length, min_length, max_length, 0.0);
+    const double risk_penalty =
+        normalizedValue(candidate.risk, min_risk, max_risk, 0.0);
     const double prs_score = params_.reliability_enabled &&
                                      std::isfinite(candidate.prs_score)
                                  ? std::max(0.0, std::min(1.0, candidate.prs_score))
                                  : 0.0;
-    PathSelectionScore score;
-    score.prs_score = prs_score;
-    score.orientation_error = initialHeadingError(candidate.path, start_yaw);
-
-    if (result.fixed_scale_score) {
-      score.normalized_length = std::isfinite(candidate.length)
-                                    ? candidate.length / params_.length_ref
-                                    : std::numeric_limits<double>::infinity();
-      score.normalized_risk = std::isfinite(candidate.risk)
-                                  ? candidate.risk / params_.risk_ref
-                                  : std::numeric_limits<double>::infinity();
-      score.normalized_prs = params_.reliability_enabled
-                                 ? prs_score / params_.prs_ref
-                                 : 0.0;
-      score.route_cost = params_.reliability_enabled
-                             ? params_.lambda_length * score.normalized_length +
-                                   params_.lambda_risk * score.normalized_risk +
-                                   params_.lambda_prs * score.normalized_prs
-                             : params_.w1 * score.normalized_length +
-                                   params_.w2 * score.normalized_risk;
-      score.utility = -score.route_cost;
-    } else {
-      score.normalized_length = std::isfinite(candidate.length)
-                                    ? 1.0 - normalizedValue(candidate.length, min_length,
-                                                            max_length, 0.0)
-                                    : 0.0;
-      score.normalized_risk = std::isfinite(candidate.risk)
-                                  ? normalizedValue(candidate.risk, min_risk,
-                                                    max_risk, 0.0)
-                                  : 1.0;
-      score.normalized_prs = prs_score;
-      score.utility = params_.reliability_enabled
-                          ? params_.lambda_length * score.normalized_length -
-                                params_.lambda_risk * score.normalized_risk +
-                                params_.lambda_prs * prs_score
-                          : result.w1 * score.normalized_length -
-                                result.w2 * score.normalized_risk;
-      score.route_cost = -score.utility;
-    }
-    result.candidate_scores.push_back(score);
+    const double cost = params_.reliability_enabled
+                            ? params_.lambda_length * length_score -
+                                  params_.lambda_risk * risk_penalty +
+                                  params_.lambda_prs * prs_score
+                            : result.w1 * length_score - result.w2 * risk_penalty;
+    const double orientation_error = initialHeadingError(candidate.path, start_yaw);
 
     const bool higher_cost = !result.success ||
-                             score.utility > result.cost + params_.orientation_tie_threshold;
+                             cost > result.cost + params_.orientation_tie_threshold;
     const bool orientation_preferred = result.success &&
-        std::abs(score.utility - result.cost) <= params_.orientation_tie_threshold &&
-        score.orientation_error < result.orientation_error;
+        std::abs(cost - result.cost) <= params_.orientation_tie_threshold &&
+        orientation_error < result.orientation_error;
     if (higher_cost || orientation_preferred) {
       result.success = true;
       result.best_index = i;
       result.best_path = candidate.path;
-      result.cost = score.utility;
-      result.route_cost = score.route_cost;
-      result.normalized_length = score.normalized_length;
-      result.normalized_risk = score.normalized_risk;
+      result.cost = cost;
+      result.normalized_length = length_score;
+      result.normalized_risk = risk_penalty;
       result.prs_score = prs_score;
-      result.orientation_error = score.orientation_error;
+      result.orientation_error = orientation_error;
     }
   }
 
   return result;
 }
 
-TopologySwitchDecision RiskAwarePathSelector::evaluateTopologySwitch(
-    double keep_cost, double challenger_cost,
-    double keep_dubins_length, double challenger_dubins_length,
-    bool active_topology_invalid) const {
-  TopologySwitchDecision decision;
-  decision.active_topology_invalid = active_topology_invalid;
-  decision.gain = (keep_cost - challenger_cost) / (keep_cost + 1e-6);
+PathSelectionResult RiskAwarePathSelector::selectStablePath(
+    const std::vector<PathSelectionCandidate>& candidates) const {
+  PathSelectionResult result;
+  result.current_topology_id = current_topology_id_;
+  std::size_t current_index = candidates.size();
+  std::size_t proposed_index = candidates.size();
+  double current_cost = std::numeric_limits<double>::infinity();
+  double proposed_cost = std::numeric_limits<double>::infinity();
 
-  if (!active_topology_invalid) {
-    if (std::isfinite(keep_dubins_length) &&
-        std::isfinite(challenger_dubins_length)) {
-      decision.connection_penalty =
-          std::max(0.0, challenger_dubins_length - keep_dubins_length) /
-          params_.dubins_ref;
-    } else if (!std::isfinite(challenger_dubins_length)) {
-      decision.connection_penalty = std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    const auto& candidate = candidates[index];
+    if (candidate.topology_id == 0 || !std::isfinite(candidate.path_cost) ||
+        !std::isfinite(candidate.risk) || candidate.path_cost < 0.0) {
+      continue;
+    }
+    const bool same_topology = candidate.topology_id == current_topology_id_;
+    if (same_topology && candidate.path_cost < current_cost) {
+      current_cost = candidate.path_cost;
+      current_index = index;
+    }
+    const double switch_cost = current_topology_id_ != 0 && !same_topology
+                                   ? params_.lambda_switch : 0.0;
+    const double total_cost = candidate.path_cost + switch_cost;
+    if (total_cost < proposed_cost ||
+        (total_cost == proposed_cost && same_topology)) {
+      proposed_cost = total_cost;
+      proposed_index = index;
     }
   }
 
-  decision.margin = decision.gain -
-                    params_.lambda_switch * decision.connection_penalty;
-  decision.propose_switch = decision.gain > 0.0 &&
-                            decision.margin > params_.switch_margin;
-  return decision;
+  if (proposed_index == candidates.size()) {
+    result.switch_decision = "NO_VALID_CANDIDATE";
+    ROS_INFO_STREAM("[TopologyStability] current=" << current_topology_id_
+                    << " candidate=0 decision=" << result.switch_decision
+                    << " gain=0");
+    return result;
+  }
+
+  result.candidate_topology_id = candidates[proposed_index].topology_id;
+  std::size_t selected_index = proposed_index;
+  if (current_topology_id_ == 0) {
+    result.switch_decision = "INITIAL";
+  } else if (proposed_index == current_index) {
+    result.switch_decision = "KEEP";
+  } else if (current_index == candidates.size()) {
+    result.switch_decision = "FORCE_SWITCH";
+  } else {
+    result.gain = (current_cost - proposed_cost) / (current_cost + kEpsilon);
+    if (result.gain > params_.switch_threshold) {
+      result.switch_decision = "SWITCH";
+    } else {
+      selected_index = current_index;
+      result.switch_decision = "KEEP";
+    }
+  }
+
+  result.success = true;
+  result.best_index = selected_index;
+  result.best_path = candidates[selected_index].path;
+  result.switch_cost = current_topology_id_ != 0 &&
+                               candidates[selected_index].topology_id != current_topology_id_
+                           ? params_.lambda_switch : 0.0;
+  result.cost = candidates[selected_index].path_cost + result.switch_cost;
+  ROS_INFO_STREAM("[TopologyStability] current=" << current_topology_id_
+                  << " candidate=" << result.candidate_topology_id
+                  << " selected=" << candidates[selected_index].topology_id
+                  << " decision=" << result.switch_decision
+                  << " gain=" << result.gain
+                  << " J_current=" << current_cost
+                  << " J_candidate=" << proposed_cost
+                  << " J_total=" << result.cost);
+  return result;
+}
+
+void RiskAwarePathSelector::commitTopology(std::uint64_t topology_id) {
+  if (topology_id != 0) current_topology_id_ = topology_id;
+}
+
+TCBSScore RiskAwarePathSelector::evaluateTCBSScore(
+    const std::vector<Eigen::Vector3d>& path,
+    double length,
+    double risk) const {
+  TCBSScore score;
+  score.efficiency = computeEfficiency(path, length);
+
+  // Reuse the existing path risk and normalize it with the fixed physical
+  // high-risk threshold. Candidate-set min/max normalization is intentionally
+  // not used because its scale changes between replanning cycles.
+  if (!std::isfinite(score.efficiency) || !std::isfinite(risk) || risk < 0.0 ||
+      !std::isfinite(params_.high_risk_threshold) ||
+      params_.high_risk_threshold <= kEpsilon) {
+    return score;
+  }
+  score.risk = std::max(0.0, std::min(1.0, risk / params_.high_risk_threshold));
+
+  // TCBS bottleneck score: the worse of efficiency and normalized risk.
+  score.bottleneck = std::max(score.efficiency, score.risk);
+  score.feasible = std::isfinite(score.bottleneck);
+  return score;
+}
+
+double RiskAwarePathSelector::computeEfficiency(
+    const std::vector<Eigen::Vector3d>& path,
+    double length) {
+  if (path.size() < 2 || !std::isfinite(length) || length <= kEpsilon) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const double direct_distance =
+      (path.back() - path.front()).head<2>().norm();
+  if (!std::isfinite(direct_distance)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  // Efficiency penalty: zero is direct, one is maximally inefficient.
+  const double efficiency = 1.0 - direct_distance / (length + kEpsilon);
+  if (!std::isfinite(efficiency)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::max(0.0, std::min(1.0, efficiency));
 }
 
 double RiskAwarePathSelector::computeAverageCorridorWidth(
@@ -235,6 +295,9 @@ double RiskAwarePathSelector::computeAverageCorridorWidth(
   double width_sum = 0.0;
   std::size_t sample_count = 0;
   for (const auto& candidate : candidates) {
+    if (!std::isfinite(candidate.risk) || !std::isfinite(candidate.length)) {
+      continue;
+    }
     for (std::size_t i = 0; i + 1 < candidate.path.size(); ++i) {
       const Eigen::Vector2d start = candidate.path[i].head<2>();
       const Eigen::Vector2d end = candidate.path[i + 1].head<2>();
@@ -300,27 +363,25 @@ RiskAwarePathSelector::Parameters RiskAwarePathSelector::sanitizeParameters(
   if (!std::isfinite(sanitized.lambda_prs) || sanitized.lambda_prs < 0.0) {
     sanitized.lambda_prs = 1.0;
   }
-  if (!std::isfinite(sanitized.length_ref) || sanitized.length_ref <= kEpsilon) {
-    sanitized.length_ref = 1.0;
-  }
-  if (!std::isfinite(sanitized.risk_ref) || sanitized.risk_ref <= kEpsilon) {
-    sanitized.risk_ref = 1.0;
-  }
-  if (!std::isfinite(sanitized.prs_ref) || sanitized.prs_ref <= kEpsilon) {
-    sanitized.prs_ref = 1.0;
-  }
-  if (!std::isfinite(sanitized.lambda_switch) || sanitized.lambda_switch < 0.0) {
-    sanitized.lambda_switch = 1.0;
-  }
-  if (!std::isfinite(sanitized.switch_margin)) {
-    sanitized.switch_margin = 0.0;
-  }
-  if (!std::isfinite(sanitized.dubins_ref) || sanitized.dubins_ref <= kEpsilon) {
-    sanitized.dubins_ref = 1.0;
-  }
   if (!std::isfinite(sanitized.orientation_tie_threshold) ||
       sanitized.orientation_tie_threshold < 0.0) {
     sanitized.orientation_tie_threshold = 0.05;
+  }
+  if (!std::isfinite(sanitized.eta_switch)) {
+    sanitized.eta_switch = 0.15;
+  }
+  sanitized.eta_switch = std::max(0.0, std::min(1.0, sanitized.eta_switch));
+  if (!std::isfinite(sanitized.switch_threshold) ||
+      sanitized.switch_threshold < 0.0) {
+    sanitized.switch_threshold = Parameters().switch_threshold;
+  }
+  if (!std::isfinite(sanitized.lambda_switch) ||
+      sanitized.lambda_switch < 0.0) {
+    sanitized.lambda_switch = Parameters().lambda_switch;
+  }
+  if (!std::isfinite(sanitized.high_risk_threshold) ||
+      sanitized.high_risk_threshold <= kEpsilon) {
+    sanitized.high_risk_threshold = Parameters().high_risk_threshold;
   }
   const double valid_map_resolution =
       std::isfinite(map_resolution) ? std::max(map_resolution, kEpsilon) : 0.1;

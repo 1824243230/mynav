@@ -17,10 +17,12 @@ namespace fast_planner {
 /**
  * @brief Builds a two-dimensional risk map from occupancy and ESDF data.
  *
- * Occupied and unknown cells bound a free-space corridor. For every known-free
- * cell, the horizontal and vertical free-space widths are computed and the
- * smaller one is used as the local corridor width. The raw risk values remain
- * available as doubles; the published OccupancyGrid is only a visualization.
+ * Occupied cells bound a potential corridor; unknown cells remain traversable
+ * with an exploration penalty. For every known-free cell, horizontal and
+ * vertical potential corridor widths are computed and the
+ * smaller one is used as the local corridor width. Unknown cells receive a
+ * finite exploration risk; occupied cells are infeasible. Raw risk values
+ * remain available as doubles; the published grid is only a visualization.
  */
 class RiskMapManager {
  public:
@@ -35,6 +37,7 @@ class RiskMapManager {
   };
 
   RiskMapManager() = default;
+  explicit RiskMapManager(const Parameters& parameters) : params_(parameters) {}
   ~RiskMapManager() = default;
 
   void init(ros::NodeHandle& nh);

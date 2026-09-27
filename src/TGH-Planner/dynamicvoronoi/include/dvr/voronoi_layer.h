@@ -165,8 +165,6 @@ struct PathData {
     save_file_stream << min_path_length << " ";
     save_file_stream << min_raw_path_length << " ";
     save_file_stream << "\n";  // 换行
-    } else {
-      std::cerr << "Failed to open file for saving path data." << std::endl;
     }
   }
 };
