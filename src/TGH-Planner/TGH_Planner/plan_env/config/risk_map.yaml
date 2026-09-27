@@ -17,16 +17,29 @@ risk_map:
 
 risk_aware_graph:
 
-  # Reference:
-  # L_ref = 10 m
-  # R_ref = 5
-  # turn_ref = 0.5 rad
+  # Length and risk use candidate maxima; gamma weights raw dimensionless AVC.
 
   alpha: 1.0
   beta: 0.40
   gamma: 0.50
+  # AVC-inspired feasibility penalty uses these positive vehicle values.
+  nominal_speed: 1.0
+  min_turn_radius: 1.0
 
   edge_sample_resolution: 0.1
+  # Fine sampling defaults to the previous edge_sample_resolution value.
+  fine_resolution: 0.1
+  coarse_resolution: 1.0
+  top_k_path: 10
+  # Candidate-set maximum normalization; also protects zero maxima.
+  normalization_epsilon: 1.0e-9
+  # CVaR uses the highest-risk 10% of samples on each edge.
+  risk_cvar_ratio: 0.1
+  risk_cvar_weight: 1.0
+  # Effectively disabled by default; set a finite operating limit as needed.
+  risk_threshold: 1.0e+100
+  # Same scale as the selector's high-risk boundary below.
+  risk_safe_threshold: 150.0
 
 
 risk_aware_path_selector:
@@ -34,6 +47,8 @@ risk_aware_path_selector:
   # TCBS is opt-in; disabled preserves the legacy path selector.
   enable_tcbs: false
   eta_switch: 0.15
+  switch_threshold: 0.1
+  lambda_switch: 0.1
 
   # normalized score:
   # length : risk = 1 : 2

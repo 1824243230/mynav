@@ -6,6 +6,7 @@
 #include <ros/ros.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -17,6 +18,8 @@ struct PathSelectionCandidate {
   double length = 0.0;
   double risk = 0.0;
   double prs_score = 0.0;
+  std::uint64_t topology_id = 0;
+  double path_cost = std::numeric_limits<double>::infinity();
 };
 
 // Lightweight TCBS evaluation data. It is intentionally not used by the
@@ -45,6 +48,11 @@ struct PathSelectionResult {
   double lambda_length = 1.0;
   double lambda_risk = 1.0;
   double lambda_prs = 1.0;
+  std::uint64_t current_topology_id = 0;
+  std::uint64_t candidate_topology_id = 0;
+  double switch_cost = 0.0;
+  double gain = 0.0;
+  const char* switch_decision = "NONE";
 };
 
 /**
@@ -74,6 +82,8 @@ class RiskAwarePathSelector {
     double lambda_prs = 1.0;
     bool enable_tcbs = false;
     double eta_switch = 0.15;
+    double switch_threshold = 0.1;
+    double lambda_switch = 0.1;
   };
 
   RiskAwarePathSelector() = default;
@@ -87,6 +97,15 @@ class RiskAwarePathSelector {
   PathSelectionResult selectBestPath(
       const std::vector<PathSelectionCandidate>& candidates,
       double start_yaw) const;
+
+  // Uses supplied J_path and topology IDs to apply switch cost and gain gate.
+  // A proposal does not change the current topology; commit only after the
+  // downstream trajectory is accepted.
+  PathSelectionResult selectStablePath(
+      const std::vector<PathSelectionCandidate>& candidates) const;
+  void commitTopology(std::uint64_t topology_id);
+  void resetTopology() { current_topology_id_ = 0; }
+  std::uint64_t currentTopologyId() const { return current_topology_id_; }
 
   TCBSScore evaluateTCBSScore(const std::vector<Eigen::Vector3d>& path,
                               double length,
@@ -110,6 +129,7 @@ class RiskAwarePathSelector {
   Parameters params_;
   RiskMapManager::Ptr risk_map_manager_;
   double map_resolution_ = 0.1;
+  std::uint64_t current_topology_id_ = 0;
 };
 
 }  // namespace fast_planner

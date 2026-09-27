@@ -742,9 +742,21 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::pruneEquivalent(const vector<vector
   vector<int> exist_paths_id;
   vector<std::pair<int, double>> scored_candidates;
   scored_candidates.reserve(paths.size());
-  for (size_t index = 0; index < paths.size(); ++index) {
-    scored_candidates.emplace_back(static_cast<int>(index),
-                                   evaluatePathCost(paths[index]).total_cost);
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
+  }
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    scored_candidates.emplace_back(static_cast<int>(selected_indices[index]),
+                                   costs[index].total_cost);
   }
   std::sort(scored_candidates.begin(), scored_candidates.end(),
             [](const std::pair<int, double>& lhs, const std::pair<int, double>& rhs) {
@@ -861,9 +873,46 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
 
   vector<TopoPath> candidates;
   candidates.reserve(paths.size());
-  for (const auto& path : paths) {
-    candidates.emplace_back(path, evaluatePathCost(path));
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
   }
+  const auto append_stored_costs = [&](const vector<TopoPath>& stored_paths) {
+    for (const auto& stored : stored_paths) {
+      RiskPathCost cost;
+      cost.length = stored.length;
+      cost.risk = stored.risk;
+      cost.curvature_cost = stored.curvature_cost;
+      if (risk_aware_edge_) {
+        const auto& weights = risk_aware_edge_->getParameters();
+        cost.total_cost = weights.alpha * cost.length +
+                          weights.beta * cost.risk +
+                          weights.gamma * cost.curvature_cost;
+      } else {
+        cost.total_cost = stored.total_cost;
+      }
+      costs.push_back(cost);
+    }
+  };
+  append_stored_costs(path_container_front_);
+  append_stored_costs(path_container_back_);
+  if (risk_aware_edge_) risk_aware_edge_->normalizeCandidateCosts(costs);
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    candidates.emplace_back(paths[selected_indices[index]], costs[index]);
+  }
+  size_t stored_index = selected_indices.size();
+  for (auto& stored : path_container_front_) stored.total_cost = costs[stored_index++].total_cost;
+  for (auto& stored : path_container_back_) stored.total_cost = costs[stored_index++].total_cost;
+  std::sort(path_container_front_.begin(), path_container_front_.end());
+  std::sort(path_container_back_.begin(), path_container_back_.end());
   std::sort(candidates.begin(), candidates.end());
 
   double minCost = std::numeric_limits<double>::max();
@@ -1007,10 +1056,22 @@ bool TopologyPRM::sameTopoPath(const vector<Eigen::Vector3d>& path1,
 int TopologyPRM::shortestPath(vector<vector<Eigen::Vector3d>>& paths) {
   int short_id = -1;
   double min_cost = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < paths.size(); ++i) {
-    const double cost = evaluatePathCost(paths[i]).total_cost;
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(paths, selected_indices, costs);
+  } else {
+    costs.reserve(paths.size());
+    selected_indices.reserve(paths.size());
+    for (size_t index = 0; index < paths.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(paths[index]));
+    }
+  }
+  for (size_t i = 0; i < selected_indices.size(); ++i) {
+    const double cost = costs[i].total_cost;
     if (short_id < 0 || cost < min_cost) {
-      short_id = i;
+      short_id = static_cast<int>(selected_indices[i]);
       min_cost = cost;
     }
   }
@@ -1376,9 +1437,21 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::searchPaths() {
 
   vector<std::pair<double, int>> ranked_paths;
   ranked_paths.reserve(raw_paths_.size());
-  for (size_t index = 0; index < raw_paths_.size(); ++index) {
-    ranked_paths.emplace_back(evaluatePathCost(raw_paths_[index]).total_cost,
-                              static_cast<int>(index));
+  vector<RiskPathCost> costs;
+  vector<size_t> selected_indices;
+  if (risk_aware_edge_) {
+    risk_aware_edge_->evaluateCandidatePaths(raw_paths_, selected_indices, costs);
+  } else {
+    costs.reserve(raw_paths_.size());
+    selected_indices.reserve(raw_paths_.size());
+    for (size_t index = 0; index < raw_paths_.size(); ++index) {
+      selected_indices.push_back(index);
+      costs.push_back(evaluatePathCost(raw_paths_[index]));
+    }
+  }
+  for (size_t index = 0; index < selected_indices.size(); ++index) {
+    ranked_paths.emplace_back(costs[index].total_cost,
+                              static_cast<int>(selected_indices[index]));
   }
   std::sort(ranked_paths.begin(), ranked_paths.end(),
             [](const std::pair<double, int>& lhs, const std::pair<double, int>& rhs) {
@@ -2902,6 +2975,31 @@ void TopologyPRM::updateAllPaths()
     }
     // publishTestPath(path_container_back_[i].path, 1);
     int debug = 0;
+  }
+
+  // Keep stored path costs on one candidate-set scale after geometry updates.
+  if (risk_aware_edge_) {
+    vector<RiskPathCost> costs;
+    costs.reserve(path_container_front_.size() + path_container_back_.size());
+    const auto append_costs = [&](const vector<TopoPath>& paths) {
+      for (const auto& path : paths) {
+        RiskPathCost cost;
+        cost.length = path.length;
+        cost.risk = path.risk;
+        cost.curvature_cost = path.curvature_cost;
+        const auto& weights = risk_aware_edge_->getParameters();
+        cost.total_cost = weights.alpha * cost.length +
+                          weights.beta * cost.risk +
+                          weights.gamma * cost.curvature_cost;
+        costs.push_back(cost);
+      }
+    };
+    append_costs(path_container_front_);
+    append_costs(path_container_back_);
+    risk_aware_edge_->normalizeCandidateCosts(costs);
+    size_t index = 0;
+    for (auto& path : path_container_front_) path.total_cost = costs[index++].total_cost;
+    for (auto& path : path_container_back_) path.total_cost = costs[index++].total_cost;
   }
 
   // 对两个组重新排序

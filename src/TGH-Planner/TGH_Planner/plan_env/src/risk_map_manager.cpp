@@ -98,15 +98,33 @@ bool RiskMapManager::computeRiskMap(const std::vector<int8_t>& occupancy,
 
   if (params_.risk_enable) {
     for (size_t index = 0; index < cell_count; ++index) {
-      const double distance = std::max(0.0, esdf_map[index]);
+      if (occupancy[index] == OCCUPIED) {
+        risks[index] = std::numeric_limits<double>::infinity();
+        risk_grid.data[index] = 100;
+        continue;
+      }
+
+      const double distance = std::isfinite(esdf_map[index])
+                                  ? std::max(0.0, esdf_map[index]) : 0.0;
+      if (occupancy[index] == UNKNOWN) {
+        // Unknown cells have no measured corridor width, and their ESDF may
+        // still be zero before observation. Give them a finite exploration
+        // cost; known occupied cells remain infeasible above.
+        const double assumed_clearance =
+            std::max(distance, std::max(params_.robot_width, resolution));
+        const double assumed_margin = std::max(params_.robot_width, resolution);
+        risks[index] = params_.lambda_unknown +
+                       params_.lambda_distance / (assumed_clearance + kEpsilon) +
+                       params_.lambda_corridor / (assumed_margin + kEpsilon);
+        risk_grid.data[index] = riskToVisualizationValue(risks[index]);
+        continue;
+      }
+
       const double distance_risk = 1.0 / (distance + kEpsilon);
       const double free_margin = std::max(0.0, widths[index] - params_.robot_width);
       const double corridor_risk = 1.0 / (free_margin + kEpsilon);
-      const double unknown_risk = occupancy[index] == UNKNOWN ? 1.0 : 0.0;
-
       risks[index] = params_.lambda_distance * distance_risk +
-                     params_.lambda_corridor * corridor_risk +
-                     params_.lambda_unknown * unknown_risk;
+                     params_.lambda_corridor * corridor_risk;
       risk_grid.data[index] = riskToVisualizationValue(risks[index]);
     }
   }
@@ -123,7 +141,7 @@ bool RiskMapManager::computeRiskMap(const std::vector<int8_t>& occupancy,
     ready_ = true;
   }
 
-  risk_pub_.publish(risk_grid);
+  if (risk_pub_) risk_pub_.publish(risk_grid);
   return true;
 }
 
@@ -136,16 +154,17 @@ void RiskMapManager::computeCorridorWidths(const std::vector<int8_t>& occupancy,
   std::vector<double> horizontal(cell_count, 0.0);
   std::vector<double> vertical(cell_count, 0.0);
 
-  // A non-free cell is a corridor boundary. Distances are measured from the
-  // cell center to the boundary of the nearest non-free cell or map boundary.
+  // Only observed obstacles bound a potential corridor. Treating unknown as
+  // a wall makes a one-cell-wide observed free strip look impassable at every
+  // exploration frontier, even when the underlying collision map allows it.
   for (int y = 0; y < size_y; ++y) {
     int run_start = 0;
     while (run_start < size_x) {
-      while (run_start < size_x && occupancy[toAddress(run_start, y, size_x)] != FREE) {
+      while (run_start < size_x && occupancy[toAddress(run_start, y, size_x)] == OCCUPIED) {
         ++run_start;
       }
       int run_end = run_start;
-      while (run_end < size_x && occupancy[toAddress(run_end, y, size_x)] == FREE) {
+      while (run_end < size_x && occupancy[toAddress(run_end, y, size_x)] != OCCUPIED) {
         ++run_end;
       }
       const double width = (run_end - run_start) * resolution;
@@ -159,11 +178,11 @@ void RiskMapManager::computeCorridorWidths(const std::vector<int8_t>& occupancy,
   for (int x = 0; x < size_x; ++x) {
     int run_start = 0;
     while (run_start < size_y) {
-      while (run_start < size_y && occupancy[toAddress(x, run_start, size_x)] != FREE) {
+      while (run_start < size_y && occupancy[toAddress(x, run_start, size_x)] == OCCUPIED) {
         ++run_start;
       }
       int run_end = run_start;
-      while (run_end < size_y && occupancy[toAddress(x, run_end, size_x)] == FREE) {
+      while (run_end < size_y && occupancy[toAddress(x, run_end, size_x)] != OCCUPIED) {
         ++run_end;
       }
       const double width = (run_end - run_start) * resolution;

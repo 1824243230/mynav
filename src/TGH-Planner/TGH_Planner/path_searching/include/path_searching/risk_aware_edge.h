@@ -18,6 +18,9 @@ struct RiskEdge {
   NodeID end = -1;
   double length = 0.0;
   double risk_cost = 0.0;
+  double maximum_risk = 0.0;
+  double avc_cost = 0.0;
+  // Compatibility alias for consumers that still read curvature_cost.
   double curvature_cost = 0.0;
   double total_cost = 0.0;
 };
@@ -25,6 +28,9 @@ struct RiskEdge {
 struct RiskPathCost {
   double length = 0.0;
   double risk = 0.0;
+  double maximum_risk = 0.0;
+  double avc_cost = 0.0;
+  // Compatibility alias for TopoPath's existing stored metric.
   double curvature_cost = 0.0;
   double total_cost = std::numeric_limits<double>::infinity();
   std::vector<RiskEdge> edges;
@@ -33,9 +39,11 @@ struct RiskPathCost {
 /**
  * @brief Evaluates Visibility-PRM edges using geometry and the 2-D risk map.
  *
- * Risk is sampled uniformly along each edge. A path's risk is the arithmetic
- * mean of its edge risks, as required by R(path) = sum(edge risk) / N.
- * Curvature is represented by the absolute heading change at each vertex.
+ * Risk is sampled uniformly along each edge. Edge risk combines the sample
+ * mean and the mean of the highest-risk samples. A path's risk is the mean
+ * of its edge risks.
+ * AVC cost penalizes turns that require excessive angular velocity at the
+ * configured nominal speed and minimum turning radius.
  */
 class RiskAwareEdge {
  public:
@@ -46,6 +54,15 @@ class RiskAwareEdge {
     double beta = 1.0;
     double gamma = 0.0;
     double sample_resolution = 0.1;
+    double normalization_epsilon = 1e-9;
+    double risk_cvar_ratio = 0.1;
+    double risk_cvar_weight = 1.0;
+    double risk_threshold = 1e100;
+    double risk_safe_threshold = 15.0;
+    double nominal_speed = 1.0;
+    double min_turn_radius = 1.0;
+    double coarse_resolution = 1.0;
+    int top_k_path = 10;
   };
 
   RiskAwareEdge() = default;
@@ -63,15 +80,29 @@ class RiskAwareEdge {
 
   RiskPathCost evaluatePath(const std::vector<Eigen::Vector3d>& path) const;
 
+  // Returns only the selected paths, with indices into the input and fine costs.
+  void evaluateCandidatePaths(
+      const std::vector<std::vector<Eigen::Vector3d>>& paths,
+      std::vector<std::size_t>& selected_indices,
+      std::vector<RiskPathCost>& fine_costs) const;
+
+  // Recompute total_cost for one candidate set; individual evaluation stays raw.
+  void normalizeCandidateCosts(std::vector<RiskPathCost>& costs) const;
+
   const Parameters& getParameters() const { return params_; }
 
  private:
   double sampleEdgeRisk(const Eigen::Vector3d& start,
                         const Eigen::Vector3d& end,
-                        double length) const;
-  static double computeCurvatureCost(const Eigen::Vector3d& previous,
-                                     const Eigen::Vector3d& current,
-                                     const Eigen::Vector3d& next);
+                        double length,
+                        double* maximum_risk) const;
+  double sampleEdgeAverageRisk(const Eigen::Vector3d& start,
+                               const Eigen::Vector3d& end,
+                               double length,
+                               double resolution) const;
+  double computeAVCCost(const Eigen::Vector3d& previous,
+                        const Eigen::Vector3d& current,
+                        const Eigen::Vector3d& next) const;
 
   Parameters params_;
   RiskMapManager::Ptr risk_map_manager_;
