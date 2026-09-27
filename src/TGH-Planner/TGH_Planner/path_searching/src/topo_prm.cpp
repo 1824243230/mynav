@@ -629,8 +629,18 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   //   int debug = 0;
   // }
 
-  // early check，这个肯定是需要的
-  if(skip_mode >= 0 && use_skip_ && (dis_pt < 2 * clearance_line_)) return true;
+  const auto& map = edt_environment_->sdf_map_;
+  if (only2D_ ? (!map->isInMap2D(Eigen::Vector2d(p1.head<2>())) ||
+                 !map->isInMap2D(Eigen::Vector2d(p2.head<2>())))
+              : (!map->isInMap(p1) || !map->isInMap(p2))) {
+    pc = p2;
+    return false;
+  }
+  if (dis_pt < 1e-9) {
+    pc = p1;
+    return (only2D_ ? map->getDistance2D(Eigen::Vector2d(p1.head<2>()))
+                    : map->getDistance(p1)) > thresh;
+  }
 
   // edge_pt只在检查两个点是否free时使用，其他检测线free时不使用
   // 判断这个点是不是edge上的点，如果是，则使用0.5 * thresh来检测距离
@@ -646,7 +656,7 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   else
   {
     step_num = ceil(skip_scale * (std::abs(dir.x()) + std::abs(dir.y())) / dis_pt);
-    step_num = min(max(1, step_num), (int)floor(dis_pt / resolution_));     
+    step_num = min(max(1, step_num), max(1, (int)floor(dis_pt / resolution_)));
   }
 
   // if(skip_mode > 0 && dis_pt > 0.7) 
@@ -657,7 +667,7 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   int iter = 0;
   // while会跳过最后一个点
   while (casters_[caster_id].step(ray_pt)) {
-    if(skip_mode >= 1 && (iter == 0 || (iter % step_num) != 0)) 
+    if(skip_mode >= 1 && (iter % step_num) != 0)
     {
         ++iter;
         continue;
@@ -670,10 +680,17 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
     // }
     pt_id_2d(0) = ray_pt(0) + offset_(0);
     pt_id_2d(1) = ray_pt(1) + offset_(1);
+    pt_id(0) = pt_id_2d(0);
+    pt_id(1) = pt_id_2d(1);
+    pt_id(2) = ray_pt(2) + offset_(2);
     dist = only2D_ ? edt_environment_->sdf_map_->getDistance2D(pt_id_2d) : edt_environment_->sdf_map_->getDistance(pt_id);
     if (dist <= (thresh)) {
-      edt_environment_->sdf_map_->indexToPos2D(pt_id_2d, pc);//pc是碰撞点
-      pc.z() = ground_height_;
+      if (only2D_) {
+        map->indexToPos2D(pt_id_2d, pc);
+        pc.z() = ground_height_;
+      } else {
+        map->indexToPos(pt_id, pc);
+      }
       return false;
     }
   }
@@ -687,18 +704,17 @@ bool TopologyPRM::lineVisib(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2
   // }
   // return true;
 
-  //  这里就是ray_pt_end，不能改
-  // TODO，这里是有错的！！
-  Eigen::Vector2i end_id;
-  end_id(0) = ray_pt(0) + offset_(0);
-  end_id(1) = ray_pt(1) + offset_(1);
-  dist = only2D_ ? edt_environment_->sdf_map_->getDistance2D(end_id) : edt_environment_->sdf_map_->getDistance(pt_id);
-  Eigen::Vector3d pt_tmp;
-  edt_environment_->sdf_map_->indexToPos2D(end_id, pt_tmp);
+  const Eigen::Vector3i end_id_3d = (p2 / resolution_ + offset_).cast<int>();
+  const Eigen::Vector2i end_id = end_id_3d.head<2>();
+  dist = only2D_ ? map->getDistance2D(end_id) : map->getDistance(end_id_3d);
   
   if (dist <= (thresh)) {
-    edt_environment_->sdf_map_->indexToPos2D(end_id, pc);
-    pc.z() = ground_height_;
+    if (only2D_) {
+      map->indexToPos2D(end_id, pc);
+      pc.z() = ground_height_;
+    } else {
+      map->indexToPos(end_id_3d, pc);
+    }
     return false;
   }
   return true;
@@ -827,17 +843,23 @@ vector<vector<Eigen::Vector3d>> TopologyPRM::selectShortPaths(vector<vector<Eige
   /* ---------- only reserve top short path ---------- */
   vector<vector<Eigen::Vector3d>> short_paths;
   vector<Eigen::Vector3d> short_path;
-  double min_cost;
+  double min_cost = std::numeric_limits<double>::infinity();
 
   // 这里还不如直接把全部都算出来，然后排序呢
   for (int i = 0; i < reserve_num_ && paths.size() > 0; ++i) {
     int path_id = shortestPath(paths);
+    if (path_id < 0 || static_cast<size_t>(path_id) >= paths.size()) {
+      ROS_WARN_THROTTLE(1.0, "No feasible candidate remains in selectShortPaths.");
+      break;
+    }
     if (i == 0) {
       short_paths.push_back(paths[path_id]);
       min_cost = evaluatePathCost(paths[path_id]).total_cost;
       paths.erase(paths.begin() + path_id);
     } else {
-      double rat = evaluatePathCost(paths[path_id]).total_cost / min_cost;
+      const double rat = min_cost > 1e-9
+                             ? evaluatePathCost(paths[path_id]).total_cost / min_cost
+                             : std::numeric_limits<double>::infinity();
       if (rat < ratio_to_short_) {
         short_paths.push_back(paths[path_id]);
         paths.erase(paths.begin() + path_id);
@@ -891,6 +913,8 @@ void TopologyPRM::selectShortPathsV2(const vector<vector<Eigen::Vector3d>>& path
       cost.length = stored.length;
       cost.risk = stored.risk;
       cost.curvature_cost = stored.curvature_cost;
+      for (const auto& edge : stored.risk_edges)
+        cost.maximum_risk = std::max(cost.maximum_risk, edge.maximum_risk);
       if (risk_aware_edge_) {
         const auto& weights = risk_aware_edge_->getParameters();
         cost.total_cost = weights.alpha * cost.length +
@@ -1902,8 +1926,7 @@ vector<Eigen::Vector3d> TopologyPRM::findDubinsShots(const Eigen::Vector3d& star
   if(minPathIdx < 0)
   {
     ROS_ERROR("Also Can not find dubins shot in path_container_back_! ERROR!");  
-    minPathIdx = 0;  
-    return path_container_front_[0].path;
+    return {};
   }
 
   // publishTestPath(dubins_shot_paths_[minPathIdx], 1); 
@@ -2987,6 +3010,8 @@ void TopologyPRM::updateAllPaths()
         cost.length = path.length;
         cost.risk = path.risk;
         cost.curvature_cost = path.curvature_cost;
+        for (const auto& edge : path.risk_edges)
+          cost.maximum_risk = std::max(cost.maximum_risk, edge.maximum_risk);
         const auto& weights = risk_aware_edge_->getParameters();
         cost.total_cost = weights.alpha * cost.length +
                           weights.beta * cost.risk +
@@ -3099,10 +3124,11 @@ void TopologyPRM::updateAllPaths()
 bool TopologyPRM::checkPathObstacle2(const std::vector<Eigen::Vector3d>& onePath)
 {
   // publishTestPath(onePath, 1);
+  if (onePath.size() < 2) return false;
 
   Eigen::Vector3d colli_pt;
   bool safty = true;
-  for(int i = 0; i < onePath.size() - 1; ++i)
+  for(size_t i = 0; i + 1 < onePath.size(); ++i)
   {
     if(!lineVisib(onePath[i], onePath[i + 1], clearance_, colli_pt, 0, -1))
     {

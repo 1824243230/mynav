@@ -124,7 +124,6 @@ RiskEdge RiskAwareEdge::evaluateEdge(NodeID start,
 RiskPathCost RiskAwareEdge::evaluatePath(const std::vector<Eigen::Vector3d>& path) const {
   RiskPathCost path_cost;
   if (path.size() < 2) {
-    path_cost.total_cost = 0.0;
     return path_cost;
   }
 
@@ -177,6 +176,12 @@ void RiskAwareEdge::evaluateCandidatePaths(
   for (std::size_t candidate_index = 0; candidate_index < paths.size();
        ++candidate_index) {
     const auto& path = paths[candidate_index];
+    if (path.size() < 2) {
+      coarse_candidates.push_back({0.0, 0.0,
+                                   std::numeric_limits<double>::infinity(),
+                                   candidate_index});
+      continue;
+    }
     double length = 0.0;
     double risk_sum = 0.0;
     for (std::size_t index = 0; index + 1 < path.size(); ++index) {
@@ -195,7 +200,9 @@ void RiskAwareEdge::evaluateCandidatePaths(
   }
 
   for (auto& candidate : coarse_candidates) {
-    candidate.score = std::isfinite(candidate.length) && std::isfinite(candidate.risk)
+    candidate.score = paths[candidate.index].size() >= 2 &&
+                              std::isfinite(candidate.length) &&
+                              std::isfinite(candidate.risk)
                           ? params_.alpha * candidate.length /
                                 (length_max + params_.normalization_epsilon) +
                                 params_.beta * candidate.risk /

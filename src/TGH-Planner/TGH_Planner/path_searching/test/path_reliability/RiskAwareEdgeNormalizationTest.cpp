@@ -135,5 +135,22 @@ TEST(RiskAwareEdgeTwoStage, RefinesAllWhenBelowTopK) {
   EXPECT_EQ(selected_indices[1], 0u);
 }
 
+TEST(RiskAwareEdgeTwoStage, RejectsPathsWithoutAnEdge) {
+  ros::Time::init();
+  RiskAwareEdge evaluator;
+  const std::vector<std::vector<Eigen::Vector3d>> paths = {
+      {}, {Eigen::Vector3d::Zero()},
+      {Eigen::Vector3d::Zero(), Eigen::Vector3d(1.0, 0.0, 0.0)}};
+  std::vector<std::size_t> selected_indices;
+  std::vector<RiskPathCost> fine_costs;
+
+  evaluator.evaluateCandidatePaths(paths, selected_indices, fine_costs);
+
+  ASSERT_EQ(selected_indices.size(), 1u);
+  EXPECT_EQ(selected_indices[0], 2u);
+  EXPECT_TRUE(std::isinf(evaluator.evaluatePath(paths[0]).total_cost));
+  EXPECT_TRUE(std::isinf(evaluator.evaluatePath(paths[1]).total_cost));
+}
+
 }  // namespace
 }  // namespace fast_planner

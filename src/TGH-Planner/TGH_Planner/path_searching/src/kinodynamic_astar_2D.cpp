@@ -384,6 +384,11 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
           // 新离散状态：从预分配池取节点，记录父指针，并加入 OPEN 集和哈希表。
           if (pro_node == NULL)
           {
+            if (use_node_num_ >= allocate_num_) {
+              ROS_WARN_STREAM("KinodynamicAstar2D node pool exhausted: "
+                              << use_node_num_ << "/" << allocate_num_);
+              return NO_PATH;
+            }
             pro_node = path_node_pool_[use_node_num_];
             pro_node->index = pro_id;
             pro_node->state = pro_state;
@@ -415,11 +420,6 @@ int KinodynamicAstar2D::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v
             tmp_expand_nodes.push_back(pro_node);
 
             use_node_num_ += 1;
-            if (use_node_num_ == allocate_num_)
-            {
-              cout << "run out of memory. use node num: " << use_node_num_ << endl;
-              return NO_PATH;
-            }
           }
           // 已在 OPEN 集且新路径的 g 更小：执行 A* 松弛并改写父指针。
           // 注意，这里不是用现在的节点替换掉之前在open set里面的节点，而是直接修改之前节点的状态和参数
@@ -701,11 +701,22 @@ std::vector<Eigen::Vector3d> KinodynamicAstar2D::getKinoTraj(double& delta_t)
   double start_v = start_vel_.norm();
   if(!is_shot_succ_) total_len_ = expand_len_;
   else total_len_ = expand_len_ + shot_len_;
+  if (!std::isfinite(total_len_) || total_len_ <= 1e-6 ||
+      !std::isfinite(delta_t) || delta_t <= 0.0 ||
+      !std::isfinite(max_acc_) || max_acc_ <= 0.0 ||
+      !std::isfinite(max_vel_) || max_vel_ <= 0.0) {
+    ROS_WARN("KinodynamicAstar2D cannot sample a zero-length or invalid trajectory.");
+    return {};
+  }
   start_v = min(start_v, max_vel_);
   std::cout << "total_len_: " << total_len_ << ", start_v: " << start_v << std::endl;
   std::cout << "expand_len_: " << expand_len_ << ", shot_len_: " << shot_len_ << std::endl;
   case_id_ = calVelOnShotTraj(start_v); 
-  int seg_num = floor(total_t_ / delta_t);
+  if (case_id_ == 0 || !std::isfinite(total_t_) || total_t_ <= 0.0) {
+    ROS_WARN("KinodynamicAstar2D produced an invalid trajectory duration.");
+    return {};
+  }
+  int seg_num = std::max(1, static_cast<int>(std::ceil(total_t_ / delta_t)));
   delta_t = total_t_ / double(seg_num); 
   std::cout << "total_t_: " << total_t_ << ", delta_t: " << delta_t << std::endl;
   // 此时的path_nodes_已经retrive过了，.back()就是最后一个节点. path_nodes_里面最少有1个
@@ -738,12 +749,19 @@ std::vector<Eigen::Vector3d> KinodynamicAstar2D::getKinoTraj(double& delta_t)
   double curv_tmp;
   for(double t = 0; t < total_t_ + 1e-3; t += delta_t_use)
   {
-    target_dis = getDist(t, start_v);
+    const double sampled_distance = getDist(std::min(t, total_t_), start_v);
+    if (!std::isfinite(sampled_distance)) return {};
+    target_dis = std::max(0.0, std::min(total_len_, sampled_distance));
     if(target_dis < expand_len_ - 1e-3)
     {
       if(target_dis > accum_dis + 1e-3) 
       {   
         ++ node_num;
+      }
+      if (node_num >= path_nodes_.size() || node_num >= vecLength.size() ||
+          path_nodes_[node_num]->input(0) == 0.0) {
+        ROS_ERROR("KinodynamicAstar2D path node index or speed is invalid.");
+        return {};
       }
       accum_dis_last = vecLength[node_num - 1];
       accum_dis      = vecLength[node_num];
@@ -752,13 +770,12 @@ std::vector<Eigen::Vector3d> KinodynamicAstar2D::getKinoTraj(double& delta_t)
       // std::cout << left_time << std::endl;
       left_num = max(0, (int)floor(left_time/expand_time_));
       
-      if(node_num >= path_nodes_.size()) 
-      {
-        ROS_ERROR_STREAM("node_num error! " << node_num << ", " << path_nodes_.size());    
-        t += delta_t_use;
-        continue;
-      }  
-      if(left_num >= path_nodes_[node_num]->mid_states_num_) ROS_ERROR_STREAM("node_num error! " << left_num);
+      if (left_num >= path_nodes_[node_num]->mid_states_num_ ||
+          static_cast<size_t>(left_num) >= path_nodes_[node_num]->mid_states_.size()) {
+        ROS_ERROR_STREAM("KinodynamicAstar2D intermediate state index invalid: "
+                         << left_num);
+        return {};
+      }
       left_time = left_time - left_num * expand_time_;
       x0 = path_nodes_[node_num]->mid_states_[left_num]; 
       stateTransit(x0, xt, path_nodes_[node_num]->input.head(2), left_time);
@@ -783,6 +800,7 @@ std::vector<Eigen::Vector3d> KinodynamicAstar2D::getKinoTraj(double& delta_t)
     // TODO: 好像不需要这个？
     // std::cout << "scale_factor: " << scale_factor << std::endl;
     delta_t_use = scale_factor * delta_t;    
+    if (!std::isfinite(delta_t_use) || delta_t_use <= 0.0) return {};
   }
   // std::cout << "getKinoTraj: 2" << std::endl;
   // // 此时的path_nodes_已经retrive过了，.back()就是最后一个节点
@@ -1104,13 +1122,13 @@ double KinodynamicAstar2D::getDist(const double& t, const double & v0)
 
 double KinodynamicAstar2D::calScaleFactor(const double& t, const double & v0, const double& curv_tmp)
 {
-  double v_tmp, acc_tang = max_acc_;
+  double v_tmp = 0.0, acc_tang = max_acc_;
   switch(case_id_)
   {
     case 1:
     {
-      v_tmp = v0 - max_acc_ * t;
-      acc_tang = max_acc_;
+      v_tmp = std::max(0.0, v0 - 0.5 * v0 * v0 * t / total_len_);
+      acc_tang = 0.5 * v0 * v0 / total_len_;
       break;
     }
     case 2:
@@ -1118,7 +1136,7 @@ double KinodynamicAstar2D::calScaleFactor(const double& t, const double & v0, co
       if(0 <= t && t <= t1_) v_tmp = v0 + max_acc_ * t;
       else if (t1_ < t)
       {
-        v_tmp = max_vel_ - max_acc_ * (t - t1_);
+        v_tmp = v_p_ - max_acc_ * (t - t1_);
       }
       break;
     }
