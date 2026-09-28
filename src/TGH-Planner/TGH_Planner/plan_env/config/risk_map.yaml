@@ -90,3 +90,20 @@ path_reliability:
   sample_resolution: 0.1
 
   debug_output: true
+
+# 可选 TRG-inspired 持久图管理；关闭时保持原有候选选择和 FSM 周期重规划行为。
+trg_management:
+  enable: false
+  local_update_radius: 4.0
+  expand_radius: 1.0
+  merge_radius: 0.35
+  connect_radius: 2.0
+  node_risk_threshold: 150.0
+  edge_risk_threshold: 150.0
+  risk_change_threshold: 0.25
+  switch_ratio: 0.15
+  update_period: 0.5
+  expansion_directions: 8
+  max_frontiers_per_update: 4
+  max_new_nodes_per_update: 8
+  max_global_nodes: 3000

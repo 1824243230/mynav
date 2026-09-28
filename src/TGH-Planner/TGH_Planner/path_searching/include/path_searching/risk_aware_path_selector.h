@@ -5,6 +5,7 @@
 #include <plan_env/risk_map_manager.h>
 #include <ros/ros.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -112,6 +113,11 @@ class RiskAwarePathSelector {
                               double risk) const;
 
   const Parameters& getParameters() const { return params_; }
+  // 可选图管理启用时复用现有 TCBS Keep/Challenger 滞回。
+  void enableTCBSHysteresis(double eta) {
+    params_.enable_tcbs = true;
+    params_.eta_switch = std::max(0.0, std::min(1.0, eta));
+  }
 
  private:
   static double computeEfficiency(const std::vector<Eigen::Vector3d>& path,

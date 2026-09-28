@@ -85,6 +85,12 @@ public:
   {
     return this->only2D_;
   }
+  bool graphManagementEnabled() const {
+    return topo_prm_ && topo_prm_->graphManagementEnabled();
+  }
+  bool updateGraphManagement(const Eigen::Vector3d& robot_pose) {
+    return topo_prm_ && topo_prm_->updateGraphManagement(robot_pose);
+  }
   void resetTopoPathContainer()
   {
     topo_prm_->resetPathContainer();

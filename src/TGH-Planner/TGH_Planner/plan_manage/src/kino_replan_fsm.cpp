@@ -233,6 +233,24 @@ void KinoReplanFSM::execFSMCallback(const ros::TimerEvent& e) {
       
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
+      if (planner_manager_->graphManagementEnabled()) {
+        // 持久图模式由当前执行路径失效/风险显著恶化触发重规划。
+        // 局部轨迹快结束且还未到目标时，也必须生成下一段轨迹。
+        if (t_cur > info->duration_ - 0.3) {
+          if ((end_pt_ - odom_pos_).norm() < no_replan_thresh_) {
+            have_target_ = false;
+            changeFSMExecState(WAIT_TARGET, "FSM");
+          } else {
+            changeFSMExecState(REPLAN_TRAJ, "TRG_HORIZON");
+          }
+          return;
+        }
+        if (planner_manager_->updateGraphManagement(odom_pos_)) {
+          changeFSMExecState(REPLAN_TRAJ, "TRG_INVALID");
+        }
+        return;
+      }
+
       /* && (end_pt_ - pos).norm() < 0.5 */
       if (t_cur > info->duration_ - 1e-2) {
         have_target_ = false;

@@ -30,6 +30,7 @@
 #include <plan_env/raycast.h>
 #include <random>
 #include <array>
+#include <memory>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <std_msgs/ColorRGBA.h>
@@ -43,6 +44,8 @@
 
 
 namespace fast_planner {
+
+class RiskAwareGraphManager;
 
 class TopoPath {
 public:
@@ -150,6 +153,12 @@ public:
 };
 
 /* ---------- node of topo graph ---------- */
+struct ManagedTopoEdge {
+  bool valid = true;
+  double risk = 0.0;
+  double last_update = 0.0;
+};
+
 class GraphNode {
 private:
   /* data */
@@ -171,10 +180,15 @@ public:
   }
 
   vector<shared_ptr<GraphNode>> neighbors_;
+  // 与 neighbors_ 下标一致；仅由可选持久图管理器使用。
+  vector<ManagedTopoEdge> managed_edges_;
   Eigen::Vector3d pos_;
   NODE_TYPE type_;
   NODE_STATE state_;
   int id_;
+  bool valid_ = true;
+  bool frontier_ = false;
+  double last_update_ = 0.0;
 
   typedef shared_ptr<GraphNode> Ptr;
 };
@@ -221,6 +235,7 @@ private:
 
   bool parallel_shortcut_;
   RiskAwareEdge::Ptr risk_aware_edge_;
+  std::unique_ptr<RiskAwareGraphManager> risk_aware_graph_manager_;
   RiskAwarePathSelector::Ptr risk_aware_path_selector_;
   PathReliabilityEvaluator::Ptr path_reliability_evaluator_;
 
@@ -388,6 +403,9 @@ public:
                       const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findDubinsShots(const Eigen::Vector3d& start_state, const double& radius);
   vector<Eigen::Vector3d> findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase);
+  // 返回是否需要重新规划；关闭图管理开关时始终返回 false。
+  bool updateGraphManagement(const Eigen::Vector3d& robot_pose);
+  bool graphManagementEnabled() const;
   void commitGuidePath(const vector<Eigen::Vector3d>& accepted_path);
   bool tryCommitGuidePath(const vector<Eigen::Vector3d>& accepted_path);
   bool rejectPendingGuidePath();

@@ -24,6 +24,7 @@
 
 
 #include <path_searching/topo_prm.h>
+#include <path_searching/risk_aware_graph_manager.h>
 #include <thread>
 #include <unordered_set>
 
@@ -141,6 +142,12 @@ void TopologyPRM::init(ros::NodeHandle& nh) {
   risk_aware_path_selector_.reset(new RiskAwarePathSelector());
   risk_aware_path_selector_->init(
       nh, edt_environment_->sdf_map_->getRiskMapManager(), resolution_);
+  risk_aware_graph_manager_.reset(new RiskAwareGraphManager(
+      edt_environment_, risk_aware_edge_, graph_));
+  risk_aware_graph_manager_->init(nh);
+  if (risk_aware_graph_manager_->enabled())
+    risk_aware_path_selector_->enableTCBSHysteresis(
+        risk_aware_graph_manager_->switchRatio());
   if (risk_aware_path_selector_->getParameters().reliability_enabled) {
     path_reliability_evaluator_.reset(new PathReliabilityEvaluator());
     path_reliability_evaluator_->init(
@@ -198,6 +205,12 @@ void TopologyPRM::initForTest(ros::NodeHandle& nh) {
   risk_aware_path_selector_.reset(new RiskAwarePathSelector());
   risk_aware_path_selector_->init(
       nh, edt_environment_->sdf_map_->getRiskMapManager(), resolution_);
+  risk_aware_graph_manager_.reset(new RiskAwareGraphManager(
+      edt_environment_, risk_aware_edge_, graph_));
+  risk_aware_graph_manager_->init(nh);
+  if (risk_aware_graph_manager_->enabled())
+    risk_aware_path_selector_->enableTCBSHysteresis(
+        risk_aware_graph_manager_->switchRatio());
   if (risk_aware_path_selector_->getParameters().reliability_enabled) {
     path_reliability_evaluator_.reset(new PathReliabilityEvaluator());
     path_reliability_evaluator_->init(
@@ -255,6 +268,18 @@ void TopologyPRM::findVoroPaths(Eigen::Vector3d start, Eigen::Vector3d end,
   bool plan_success =  edt_environment_->sdf_map_->voro_plan(start, end);
   if (!plan_success) ROS_WARN("[IncrementalTopo] Voronoi planner returned no path.");
   short_paths_ = edt_environment_->sdf_map_->getVoroPaths(ground_height_);
+  if (risk_aware_graph_manager_ && risk_aware_graph_manager_->enabled()) {
+    // 原 Voronoi 路径作为持久 graph_ 的初始骨架；之后只增补，不清空历史图。
+    risk_aware_graph_manager_->seedFromPaths(short_paths_);
+    // 本调用中的 start.z 存放车头航向角，图路径的 z 必须仍为地面高度。
+    Eigen::Vector3d managed_start = start;
+    Eigen::Vector3d managed_end = end;
+    managed_start.z() = ground_height_;
+    managed_end.z() = ground_height_;
+    const auto persistent_path =
+        risk_aware_graph_manager_->findManagedPath(managed_start, managed_end);
+    if (persistent_path.size() >= 2) short_paths_.push_back(persistent_path);
+  }
   int path_size_by_voro = short_paths_.size();
   voro_plan_time = (ros::Time::now() - t1).toSec();
   /* ---------- prune equivalent paths ---------- */
@@ -1934,6 +1959,15 @@ vector<Eigen::Vector3d> TopologyPRM::findDubinsShots(const Eigen::Vector3d& star
 }
 
 
+bool TopologyPRM::graphManagementEnabled() const {
+  return risk_aware_graph_manager_ && risk_aware_graph_manager_->enabled();
+}
+
+bool TopologyPRM::updateGraphManagement(const Eigen::Vector3d& robot_pose) {
+  return graphManagementEnabled() &&
+         risk_aware_graph_manager_->updateGraphManagement(robot_pose);
+}
+
 // Select the guide path with the legacy risk-aware utility, or with TCBS
 // Keep/Challenger separation when the opt-in switch is enabled.
 vector<Eigen::Vector3d> TopologyPRM::findGuidePath(const Eigen::Vector3d& start_state, vector<Eigen::Vector3d>& path_pts_sprase) {
@@ -2169,6 +2203,8 @@ bool TopologyPRM::tryCommitGuidePath(
     if (topology_reversed) ++tcbs_statistics_.topology_reversal_count;
     last_best_path_ = guide;
     pending_path_id_ = 0;
+    if (graphManagementEnabled())
+      risk_aware_graph_manager_->setCurrentPath(accepted_path);
     ROS_DEBUG_STREAM("[TCBS] mode=BASELINE accepted_stats planning_cycles="
                      << tcbs_statistics_.planning_cycle_count
                      << " topology_switches="
@@ -2273,6 +2309,8 @@ bool TopologyPRM::tryCommitGuidePath(
                    << tcbs_statistics_.challenger_rejected_by_eta_count);
   pending_path_id_ = 0;
   pending_tcbs_decision_ = TCBSPendingDecision::NONE;
+  if (graphManagementEnabled())
+    risk_aware_graph_manager_->setCurrentPath(accepted_path);
   return true;
 }
 

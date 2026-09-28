@@ -31,7 +31,7 @@ include_directories(
     ${PCL_INCLUDE_DIRS}
 )
 
-set(CMAKE_CXX_FLAGS "-std=c++17")
+set(CMAKE_CXX_FLAGS "-std=c++14")
 set(CMAKE_BUILD_TYPE "Release")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -47,6 +47,7 @@ add_library( path_searching
     src/astar.cpp
     src/astar_2D.cpp
     src/risk_aware_edge.cpp
+    src/risk_aware_graph_manager.cpp
     src/risk_aware_path_selector.cpp
     src/path_reliability/PathReliabilityEvaluator.cpp
     src/topo_prm.cpp
